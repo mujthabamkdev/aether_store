@@ -1,7 +1,9 @@
 pub mod kernel;
 pub mod guard;
+pub mod loom;
 pub use kernel::AetherKernel;
 pub use guard::AetherGuard;
+pub use loom::AetherLoom;
 
 use sled::Db;
 use blake3::Hasher;
@@ -24,6 +26,7 @@ pub struct LogicAtom {
     pub data: Vec<u8>,       // Constants or static parameters
 }
 
+#[derive(Clone)]
 pub struct AetherVault {
     db: Db,
 }
