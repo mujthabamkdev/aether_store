@@ -1,0 +1,11 @@
+[package]
+name = "aether_store"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+blake3 = "1.8.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sled = "0.34.7"
+thiserror = "2.0.18"
