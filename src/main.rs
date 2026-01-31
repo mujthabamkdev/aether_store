@@ -1,8 +1,131 @@
-use aether_store::{AetherVault, AetherKernel, AetherOrchestrator};
+use aether_store::{AetherVault, AetherKernel, AetherOrchestrator, ProductTemplate, InputSchema};
 use std::fs;
 use std::sync::Arc;
-use axum::{Router, routing::get, Json};
-use tower_http::services::ServeDir;
+use axum::{Router, routing::{get, post}, Json, extract::{State, Query}, http::Method};
+use tower_http::{services::ServeDir, cors::{CorsLayer, Any}};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+#[derive(Deserialize)]
+struct OrchestrationRequest {
+    manifest: String,
+    // inputs: HashMap<String, Value> // Future extension
+}
+
+#[derive(Serialize)]
+struct OrchestrationResult {
+    root_hash: String,
+    output: serde_json::Value,
+    logs: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RunTemplateRequest {
+    product_id: String,
+    inputs: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct InspectQuery {
+    id: String,
+}
+
+async fn handle_orchestration(
+    State(vault): State<Arc<AetherVault>>,
+    Json(payload): Json<OrchestrationRequest>,
+) -> Json<OrchestrationResult> {
+    
+    // 1. Build the App from the manifest
+    // Since Orchestrator is stateless but needs vault, we create one.
+    // (In real app, we might cache Orchestrators or keep one in State too)
+    let orchestrator = AetherOrchestrator::new((*vault).clone()).unwrap(); // Clone underlying vault (wrapper)
+    
+    match orchestrator.build_app(&payload.manifest) {
+        Ok(root_hash) => {
+            // 2. Execute
+            let kernel = AetherKernel::new((*vault).clone());
+            match kernel.execute_smart(&root_hash).await {
+                Ok(result) => Json(OrchestrationResult {
+                    root_hash,
+                    output: result,
+                    logs: vec!["Execution Successful".to_string()]
+                }),
+                Err(e) => Json(OrchestrationResult {
+                    root_hash,
+                    output: serde_json::json!({"error": e.to_string()}),
+                    logs: vec![format!("Execution Error: {}", e)]
+                })
+            }
+        },
+        Err(e) => Json(OrchestrationResult {
+            root_hash: String::new(),
+            output: serde_json::json!({"error": e.to_string()}),
+            logs: vec![format!("Build Error: {}", e)]
+        })
+    }
+}
+
+async fn handle_inspect(
+    Query(query): Query<InspectQuery>,
+) -> Json<serde_json::Value> {
+    let catalog_path = "../catalog.json";
+    if let Ok(content) = fs::read_to_string(catalog_path) {
+        let catalog: HashMap<String, ProductTemplate> = serde_json::from_str(&content).unwrap_or_default();
+        if let Some(product) = catalog.get(&query.id) {
+             return Json(serde_json::json!(product));
+        }
+    }
+    Json(serde_json::json!({"error": "Product not found"}))
+}
+
+async fn handle_run_template(
+    State(vault): State<Arc<AetherVault>>,
+    Json(payload): Json<RunTemplateRequest>,
+) -> Json<OrchestrationResult> {
+    let catalog_path = "../catalog.json";
+    let content = fs::read_to_string(catalog_path).unwrap_or_default();
+    let catalog: HashMap<String, ProductTemplate> = serde_json::from_str(&content).unwrap_or_default();
+
+    if let Some(product) = catalog.get(&payload.product_id) {
+        // Hydrate Template
+        let mut manifest = product.manifest_template.clone();
+        for (key, val) in payload.inputs {
+            let placeholder = format!("{{{{{}}}}}", key); // {{key}}
+            manifest = manifest.replace(&placeholder, &val);
+        }
+
+        // Build & Run
+        let orchestrator = AetherOrchestrator::new((*vault).clone()).unwrap();
+         match orchestrator.build_app(&manifest) {
+            Ok(root_hash) => {
+                let kernel = AetherKernel::new((*vault).clone());
+                match kernel.execute_smart(&root_hash).await {
+                    Ok(result) => Json(OrchestrationResult {
+                        root_hash,
+                        output: result,
+                        logs: vec!["Template Executed".to_string()]
+                    }),
+                    Err(e) => Json(OrchestrationResult {
+                        root_hash,
+                        output: serde_json::json!({"error": e.to_string()}),
+                        logs: vec![format!("Execution Error: {}", e)]
+                    })
+                }
+            },
+            Err(e) => Json(OrchestrationResult {
+                root_hash: String::new(),
+                output: serde_json::json!({"error": e.to_string()}),
+                logs: vec![format!("Build Error: {}", e)]
+            })
+        }
+    } else {
+        Json(OrchestrationResult {
+            root_hash: String::new(),
+            output: serde_json::json!({"error": "Product ID not found"}),
+            logs: vec!["Catalog Error".to_string()]
+        })
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,126 +138,221 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait, AetherVault is strict.
     
     // Easier path: Use the standard flow for CLI, then spin up the server with a shared reference or re-open.
-    // Since we are running single-threaded logically (CLI then Server), re-opening or sharing is fine.
     // However, sled::Db is thread safe.
     
-    // Changing AetherVault to allow cloning (we did derive Clone earlier!)
-    let vault_for_cli = (*vault).clone(); 
-    
-    let orchestrator = AetherOrchestrator::new(vault_for_cli.clone())?;
-    let kernel = AetherKernel::new(vault_for_cli.clone());
-
-    println!("--- Aether Tool v1.0 (Orchestrator + Logic Grid Mode) ---");
-    
-
-    // ... CLI Logic ...
-    let manifest_path = "../guardian.yaml";
-    if std::path::Path::new(manifest_path).exists() {
-        println!("Found Manifest: {}", manifest_path);
-        let content = fs::read_to_string(manifest_path)?;
-        
-        match orchestrator.build_app(&content) {
-            Ok(root_hash) => {
-                println!("\n[Success] App Built. Root Hash: {}", root_hash);
-                if !root_hash.is_empty() {
-                    println!("[Kernel] Executing Root Node with Metrics...");
-                    
-                    // 1. Execute and Measure
-                    match kernel.execute_with_metrics(&root_hash) {
-                        Ok((res, duration)) => {
-                            println!("[Kernel] Root Result: {}", res);
-                            println!("[Kernel] Execution Time: {}ns", duration);
-                            
-                            // 2. Autonomous Evolution
-                            // Create separate Loom/Guard/Vault for optimizer loop as main owns them inside 'orchestrator'
-                            // but we can create new ones or just use the local 'orchestrator' if it exposed them.
-                            // Better: Create new lightweight instances for this phase.
-                            let loom = aether_store::AetherLoom::new().unwrap();
-                            let guard = aether_store::AetherGuard::new();
-                            let optimizer = aether_store::AetherOptimizer::new(100); // 100ns threshold (very low to force trigger)
-                            
-                            if let Some(better_atom) = optimizer.optimize_if_needed(&root_hash, duration, &loom) {
-                                match vault.persist_verified(&better_atom, &guard) {
-                                    Ok(new_hash) => {
-                                        println!("[System] Evolved! New optimized root hash: {}", new_hash);
-                                        // Execute the new one to prove it works
-                                         match kernel.execute_with_metrics(&new_hash) {
-                                            Ok((res_new, _)) => println!("[Kernel] Optimized Result: {}", res_new),
-                                            Err(_) => {}
-                                        }
-                                    },
-                                    Err(e) => println!("[System] Evolution blocked by Guard: {}", e),
-                                }
-                            }
-                        },
-                        Err(e) => println!("[Kernel] Execution Error: {}", e),
-                    }
-                }
-            },
-            Err(e) => println!("[Error] Orchestrator failed: {}", e),
-        }
-        
-        // --- PHASE 8 I/O DEMO ---
-        println!("\n--- Phase 8: I/O Resonator (Sovereignty Check) ---");
+    // --- Registry Bootstrap (Atoms) ---
+    // Ensure core logic atoms exist in the vault and registry
+    let registry_path = "../registry.json";
+    // Always load atoms first (Bootstrap Registry)
+    if !std::path::Path::new(registry_path).exists() {
+        println!("[System] Bootstrapping Logic Registry...");
+        let loom = aether_store::AetherLoom::new().unwrap();
         let guard = aether_store::AetherGuard::new();
-        
-        // 1. BLOCKED: Sovereign data to foreign domain
-        let foreign_contract = aether_store::IOContract {
-            endpoint: "https://google.com/data".to_string(),
-            schema: serde_json::json!({"type": "object"}),
-            sensitivity: 2, // Sovereign
-        };
-        let foreign_atom = aether_store::LogicAtom {
-            op_code: 500,
-            inputs: vec![],
-            data: serde_json::to_vec(&foreign_contract).unwrap(),
-        };
-        
-        match vault.persist_verified(&foreign_atom, &guard) {
-            Ok(_) => println!("[Warning] Guard FAILED to block foreign sovereign data!"),
-            Err(e) => println!("[Guard] SUCCESS: Blocked foreign sovereign request. Reason: {}", e),
-        }
-        
-        // 2. ALLOWED: Sovereign data to localhost (Our own Logical Grid API)
-        let local_contract = aether_store::IOContract {
-            endpoint: "http://localhost:3000/api/graph".to_string(), // Our own grid
-            schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "nodes": { "type": "array" },
-                    "edges": { "type": "array" }
-                },
-                "required": ["nodes", "edges"]
-            }),
-            sensitivity: 2, // Sovereign
-        };
-        let local_atom = aether_store::LogicAtom {
-            op_code: 500,
-            inputs: vec![],
-            data: serde_json::to_vec(&local_contract).unwrap(),
-        };
-        
-        match vault.persist_verified(&local_atom, &guard) {
-            Ok(io_hash) => {
-                println!("[Guard] Verified Sovereign Local IO. Hash: {}", io_hash);
-                // Note: Kernel execute_io is async. We are in tokio::main, so we can await.
-                println!("[Kernel] Executing Local IO (Fetching Logic Grid Graph)...");
-                match kernel.execute_io(&io_hash).await {
-                    Ok(json) => println!("[Kernel] IO Success! Fetched {} nodes.", json["nodes"].as_array().unwrap().len()),
-                    Err(e) => println!("[Kernel] IO Execution Failed: {}", e),
-                }
-            },
-            Err(e) => println!("[Guard] Blocked valid request? {}", e),
-        }
+        let mut registry = std::collections::HashMap::new();
 
-    } else {
-        println!("No manifest found. Skipping build.");
+        // 1. MODERN_LAW
+        let atom_modern = loom.weave("Filter where built > 2020").unwrap();
+        let hash_modern = vault.persist_verified(&atom_modern, &guard).unwrap();
+        registry.insert("HASH_OF_MODERN_FILTER".to_string(), hash_modern.clone());
+        println!("[Registry] Minted MODERN_LAW: {}", hash_modern);
+
+        // 2. RIBA_LAW
+        let atom_riba = loom.weave("Verify 0% interest").unwrap();
+        let hash_riba = vault.persist_verified(&atom_riba, &guard).unwrap();
+        registry.insert("HASH_OF_RIBA_CHECK".to_string(), hash_riba.clone());
+        println!("[Registry] Minted RIBA_LAW: {}", hash_riba);
+        
+        let json = serde_json::to_string_pretty(&registry).unwrap();
+        fs::write(registry_path, json).unwrap();
+    }
+    
+    // Read Registry for Hashes needed in templates
+    let registry_content = fs::read_to_string(registry_path).unwrap_or("{}".to_string());
+    let registry: HashMap<String, String> = serde_json::from_str(&registry_content).unwrap_or_default();
+    let hash_modern = registry.get("HASH_OF_MODERN_FILTER").unwrap_or(&"ERROR".to_string()).clone();
+    let hash_riba = registry.get("HASH_OF_RIBA_CHECK").unwrap_or(&"ERROR".to_string()).clone();
+
+    // --- Catalog Bootstrap (Templates) ---
+    let catalog_path = "../catalog.json";
+    if !std::path::Path::new(catalog_path).exists() {
+        println!("[System] Bootstrapping Product Catalog...");
+        let mut catalog = HashMap::new();
+        
+        let transit_template = format!(r#"
+app_name: "KL Generative Transit"
+imports:
+  - name: "MODERN_LAW"
+    hash: "{}"
+  - name: "RIBA_LAW"
+    hash: "{}"
+nodes:
+  - name: "fetch_kl_properties"
+    intent: "Fetch from http://127.0.0.1:8080/kl/properties"
+    dependencies: []
+  - name: "filter_modern"
+    use_ref: "MODERN_LAW"
+    dependencies: ["fetch_kl_properties"]
+  - name: "filter_type"
+    intent: "Filter where station_type == {{station_type}}"
+    dependencies: ["filter_modern"]
+  - name: "filter_name"
+    intent: "Filter where station contains {{station_name}}"
+    dependencies: ["filter_type"]
+  - name: "riba_audit"
+    use_ref: "RIBA_LAW"
+    dependencies: ["filter_name"]
+  - name: "root"
+    intent: "Output verified listings"
+    dependencies: ["riba_audit"]
+"#, hash_modern, hash_riba);
+
+        let product = ProductTemplate {
+            id: "PRODUCT:KL-Transit-Home".to_string(),
+            name: "KL Transit Home Finder".to_string(),
+            manifest_template: transit_template,
+            inputs: vec![
+                InputSchema {
+                    name: "station_type".to_string(),
+                    label: "Station Type (LRT, MRT, KTM)".to_string(),
+                    input_type: "select".to_string(),
+                    options: Some(vec!["LRT".to_string(), "MRT".to_string(), "KTM".to_string(), "Monorail".to_string()]),
+                },
+                InputSchema {
+                    name: "station_name".to_string(),
+                    label: "Preferred Station Name".to_string(),
+                    input_type: "text".to_string(),
+                    options: None,
+                }
+            ],
+        };
+        
+        catalog.insert(product.id.clone(), product);
+        let json = serde_json::to_string_pretty(&catalog).unwrap();
+        fs::write(catalog_path, json).unwrap();
     }
 
-    // Keep main alive to serve
-    println!("\n[System] System is running. Press Ctrl+C to stop.");
-    std::future::pending::<()>().await;
+    // --- Start Web Server ---
+    let user_vault = Arc::clone(&vault);
+    
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers(Any);
 
+    let app = Router::new()
+        .route("/api/graph", get(move || async move { 
+            Json(user_vault.export_graph_json()) 
+        }))
+        .route("/api/registry", get(|| async {
+            match fs::read_to_string("../registry.json") {
+                Ok(content) => content,
+                Err(_) => "{}".to_string()
+            }
+        }))
+        .route("/api/inspect", get(handle_inspect))
+        .route("/api/run_template", post(handle_run_template))
+        .route("/api/orchestrate", post(handle_orchestration))
+        .route("/api/orchestrate_project", post(handle_orchestrate_project))
+        .route("/api/execute", post(handle_execution_by_hash))
+        .route("/api/projects", get(handle_list_projects))
+        .with_state(Arc::clone(&vault))
+        .layer(cors)
+        .fallback_service(ServeDir::new("../universal_shell"));
+
+    println!("[Engine] Universal Logic Engine Active: http://localhost:3000");
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    axum::serve(listener, app).await?;
+    
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct ExecuteRequest {
+    hash: String,
+}
+
+#[derive(Deserialize)]
+struct ProjectRequest {
+    name: String,
+}
+
+async fn handle_orchestrate_project(
+    State(vault): State<Arc<AetherVault>>,
+    Json(payload): Json<ProjectRequest>,
+) -> Json<OrchestrationResult> {
+    let path = format!("../../products/{}/manifest.yaml", payload.name); // Security risk in prod (path traversal), demo ok
+    match fs::read_to_string(&path) {
+        Ok(content) => {
+             let orchestrator = AetherOrchestrator::new((*vault).clone()).unwrap(); 
+             // Build
+             match orchestrator.build_app(&content) {
+                Ok(root_hash) => {
+                     // Exec
+                    let kernel = AetherKernel::new((*vault).clone());
+                    match kernel.execute_smart(&root_hash).await {
+                        Ok(result) => Json(OrchestrationResult {
+                            root_hash,
+                            output: result,
+                            logs: vec![format!("Project '{}' Build & Exec Successful", payload.name)]
+                        }),
+                        Err(e) => Json(OrchestrationResult {
+                            root_hash,
+                            output: serde_json::json!({"error": e.to_string()}),
+                            logs: vec![format!("Execution Error: {}", e)]
+                        })
+                    }
+                },
+                Err(e) => Json(OrchestrationResult {
+                     root_hash: String::new(),
+                     output: serde_json::json!({"error": e.to_string()}),
+                     logs: vec![format!("Build Error: {}", e)]
+                })
+             }
+        },
+        Err(e) => Json(OrchestrationResult {
+             root_hash: String::new(),
+             output: serde_json::json!({"error": e.to_string()}),
+             logs: vec![format!("Manifest Read Error: {}", e)]
+        })
+    }
+}
+
+async fn handle_list_projects() -> Json<Vec<String>> {
+    let projects_dir = "../../products"; // Relative to warehouse/engine
+    let mut projects = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(projects_dir) {
+        for entry in entries {
+             if let Ok(entry) = entry {
+                 if let Ok(file_type) = entry.file_type() {
+                     if file_type.is_dir() {
+                         if let Ok(name) = entry.file_name().into_string() {
+                             projects.push(name);
+                         }
+                     }
+                 }
+             }
+        }
+    }
+    Json(projects)
+}
+
+async fn handle_execution_by_hash(
+    State(vault): State<Arc<AetherVault>>,
+    Json(payload): Json<ExecuteRequest>,
+) -> Json<OrchestrationResult> {
+    let kernel = AetherKernel::new((*vault).clone());
+    match kernel.execute_smart(&payload.hash).await {
+         Ok(result) => Json(OrchestrationResult {
+            root_hash: payload.hash,
+            output: result,
+            logs: vec!["Executed from Registry".to_string()]
+        }),
+        Err(e) => Json(OrchestrationResult {
+            root_hash: payload.hash,
+            output: serde_json::json!({"error": e.to_string()}),
+            logs: vec![format!("Execution Error: {}", e)]
+        })
+    }
 }
 

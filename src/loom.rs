@@ -1,114 +1,130 @@
 use anyhow::{Result, Ok};
-use crate::LogicAtom;
+use crate::{LogicAtom, write_blob};
 
 // Placeholder for Candle-based LLM state
 pub struct AetherLoom {
     // Reference to model/tokenizer would go here
-    // e.g. model: Qwen2ForCausalLM,
-    // tokenizer: Tokenizer
 }
 
 impl AetherLoom {
     pub fn new() -> Result<Self> {
-        // In full version: Load quantized model here (e.g. Llama-3-8B)
-        // let device = Device::Cpu;
-        // let model = ...
         Ok(Self {})
     }
 
     /// Constrains the AI to output ONLY a specific JSON format
-    const SYSTEM_PROMPT: &'static str = "You are Aether-Loom. 
-    Output ONLY valid JSON for LogicAtom. 
-    OpCodes: 1=ADD (data: 8 bytes for two i32). 
-    Input: 'Add 10 and 20' 
-    Output: {\"op_code\": 1, \"inputs\": [], \"data\": [10, 0, 0, 0, 20, 0, 0, 0]}";
+    const SYSTEM_PROMPT: &'static str = "You are Aether-Loom. Output ONLY valid JSON for LogicAtom.";
 
-    pub fn weave(&self, human_intent: &str) -> Result<LogicAtom> {
-        // 1. Run inference using candle-transformers
-        // TODO: Implement candle inference loop when model weights are available.
-        // For now, we use a heuristic parser that mimics the AI's intended output.
-        
-        println!("[Loom] System Prompt: {}", Self::SYSTEM_PROMPT);
-        println!("[Loom] Processing Intent: '{}'", human_intent);
+    pub fn weave(&self, intent: &str) -> Result<LogicAtom> {
+        // Default context for now (User request mandates "context_id" in DataAtom)
+        // Since `weave` is called by Registry/Bootstrap (GLOBAL context), we default to "global".
+        // But if `orchestrator` calls it, it might need to pass context.
+        // For now, I'll update the signature to `weave(&self, intent: &str, context: &str)`.
+        self.weave_with_context(intent, "global")
+    }
+    
+    pub fn weave_with_context(&self, intent: &str, context: &str) -> Result<LogicAtom> {
+        println!("[Loom] Processing Intent: '{}' in context '{}'", intent, context);
 
-        let lower = human_intent.to_lowercase();
-        // Mimic the AI understanding "Add X and Y"
-        if lower.contains("add") && lower.contains("and") {
-            let parts: Vec<&str> = lower.split_whitespace().collect();
-            let mut numbers = Vec::new();
-            for p in parts {
-                if let std::result::Result::Ok(n) = p.parse::<i32>() {
-                    numbers.push(n);
-                }
-            }
-            
-            if numbers.len() >= 2 {
-                return Ok(LogicAtom {
-                    op_code: 1,
-                    inputs: vec![],
-                    data: [
-                        numbers[0].to_le_bytes(), 
-                        numbers[1].to_le_bytes()
-                    ].concat(), // 8 bytes
-                });
-            }
-        } else if lower.contains("calculate zakat for") {
-            // "Calculate Zakat for 5000"
-            let parts: Vec<&str> = lower.split_whitespace().collect();
-            let mut amount = 0;
-            for p in parts {
-                if let std::result::Result::Ok(n) = p.parse::<i32>() {
-                    amount = n;
-                }
-            }
-            
-            // LogicAtom for Zakat: OpCode 100 (Financial), Rate 0, Amount X
-            return Ok(LogicAtom {
-                op_code: 100,
+        let parts: Vec<&str> = intent.split_whitespace().collect();
+        if parts.is_empty() {
+             return Err(anyhow::anyhow!("Empty intent"));
+        }
+
+        // 1. Generic IO: "Fetch from <URL>"
+        if parts[0] == "Fetch" && parts.contains(&"from") {
+             if let Some(url_idx) = parts.iter().position(|&x| x == "from") {
+                 if url_idx + 1 < parts.len() {
+                     let url = parts[url_idx+1];
+                     let contract = crate::IOContract {
+                         endpoint: url.to_string(),
+                         schema: serde_json::json!({"type": "array"}),
+                         sensitivity: if url.contains("localhost") || url.contains("127.0.0.1") { 2 } else { 0 },
+                     };
+                     
+                     let blob = serde_json::to_vec(&contract)?;
+                     let ref_uri = write_blob(&blob)?;
+                     
+                     return Ok(LogicAtom {
+                         op_code: 500,
+                         inputs: vec![],
+                         storage_ref: ref_uri,
+                         context_id: context.to_string(),
+                     });
+                 }
+             }
+        }
+
+        // 2. Generic Filter: "Filter where <field> <op> <value>"
+        // Example: "Filter where built > 2020"
+        if parts[0] == "Filter" && parts.get(1) == Some(&"where") && parts.len() >= 5 {
+             let field = parts[2];
+             let op = parts[3];
+             // Support multi-word values (e.g. "Bukit Bintang")
+             let val_str = parts[4..].join(" ");
+             
+             // Try parsing val as number, else string
+             let val_json = if let std::result::Result::Ok(num) = val_str.parse::<i64>() {
+                 serde_json::to_value(num)?
+             } else {
+                 serde_json::to_value(&val_str)?
+             };
+
+             let config = serde_json::json!({
+                "field": field,
+                "op": op,
+                "val": val_json
+             });
+
+             let blob = serde_json::to_vec(&config)?;
+             let ref_uri = write_blob(&blob)?;
+
+             return Ok(LogicAtom {
+                op_code: 2, // FILTER
                 inputs: vec![],
-                data: [
-                    0i32.to_le_bytes(), // Rate = 0 (Halal)
-                    amount.to_le_bytes()
-                ].concat()
-            });
-        } else if lower.contains("optimize") {
-            // Heuristic: "Optimize the logic for node X" 
-            // In a real system, this would analyze the graph and replace inefficient subgraphs.
-            // For this demo, we assume the optimization is for the "Add" operation, 
-            // and we return a "Super Add" atom (OpCode 2, hypothetically faster or just different).
-            // Or better, we return the SAME atom structure but with a "optimized" marker in logging?
-            // Let's simluate a "Optimized Add" using the same OpCode 1 but logic implies it was improved.
-            // Actually, let's pretend OpCode 1 IS the basic one. 
-            // We will return a standard ADD atom, effectively reinstalling it (simulating a 'rewrite').
-            // To make it interesting, let's support "Add 200 and 300" extraction from context if possible, 
-            // but the prompt is generic "Optimize hash...".
-            // Since we don't have the original text intent stored, we can't easily recreate the exact logic *values* 
-            // without fetching the atom.
-            
-            // Simplification: The Optimizer passes the *intent* to optimize, but Loom needs context.
-            // Let's assume the Optimizer asks "Optimize Add 200 and 300" explicitly if it knew.
-            // But the current plan says: "Optimize the logic for the node with hash {hash}".
-            // Loom can't look up the vault (it doesn't have reference).
-            
-            // ADJUSTMENT: Loom simply acknowledges it.
-            // BUT, to satisfy the `LogicAtom` return type, we need to return a valid atom.
-            // Let's return a special "Optimized ADD" for the demo case of 500 (200+300).
-            // Ideally, main.rs should pass the *original atom's data* to Loom or Loom should have Vault access.
-            // Given the constraints, let's make the Optimizer smart enough to construct a 'better' intent
-            // OR make Loom return a hardcoded "Optimized Root" for the specific demo scenario.
-            
-            return Ok(LogicAtom {
-                op_code: 1, // Same OpCode
-                inputs: vec![],
-                data: [
-                    200i32.to_le_bytes(), 
-                    300i32.to_le_bytes()
-                ].concat()
+                storage_ref: ref_uri,
+                context_id: context.to_string(),
             });
         }
         
-        Err(anyhow::anyhow!("Loom currently requires 'Add X and Y' or 'Calculate Zakat for X'."))
+        // 3. Generic Financial: "Verify ..." (Placeholder)
+        if parts[0] == "Verify" {
+             // Just identity, empty blob
+             let ref_uri = write_blob(&[])?;
+             return Ok(LogicAtom {
+                 op_code: 100, 
+                 inputs: vec![],
+                 storage_ref: ref_uri,
+                 context_id: context.to_string(),
+             });
+        }
+        
+        // 4. Output/Identity
+        if parts[0] == "Output" {
+            let ref_uri = write_blob(&[])?;
+             return Ok(LogicAtom {
+                op_code: 100, // Identity
+                inputs: vec![],
+                storage_ref: ref_uri,
+                context_id: context.to_string(),
+            });
+        }
+
+
+        // Fallback: Legacy "Add X and Y"
+        if parts[0] == "Add" && parts.len() >= 4 {
+             let a: i32 = parts[1].parse().unwrap_or(0);
+             let b: i32 = parts[3].parse().unwrap_or(0);
+             let blob = [a.to_le_bytes(), b.to_le_bytes()].concat();
+             let ref_uri = write_blob(&blob)?;
+             
+             return Ok(LogicAtom {
+                 op_code: 1,
+                 inputs: vec![],
+                 storage_ref: ref_uri,
+                 context_id: context.to_string(),
+             });
+        }
+
+        Err(anyhow::anyhow!("Loom could not generic intent: '{}'", intent))
     }
 }
-
-

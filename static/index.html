@@ -1,56 +1,244 @@
 <!DOCTYPE html>
 <html>
+
 <head>
     <title>Aether Logic Grid</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=JetBrains+Mono:wght@400&display=swap"
+        rel="stylesheet">
     <style>
-        body { margin: 0; padding: 0; background: #1a1a1a; color: #fff; font-family: sans-serif; }
-        #cy { width: 100vw; height: 100vh; display: block; }
-        #overlay { position: absolute; top: 10px; left: 10px; z-index: 10; background: rgba(0,0,0,0.7); padding: 10px; border-radius: 5px; }
+        :root {
+            --bg-color: #050505;
+            --accent-cyan: #00f3ff;
+            --accent-purple: #bc13fe;
+            --glass-bg: rgba(20, 20, 20, 0.6);
+            --glass-border: rgba(255, 255, 255, 0.1);
+            --text-main: #ffffff;
+            --text-dim: #888888;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background: var(--bg-color);
+            color: var(--text-main);
+            font-family: 'Inter', sans-serif;
+            overflow: hidden;
+        }
+
+        #cy {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+            background: radial-gradient(circle at center, #111 0%, #000 100%);
+        }
+
+        .glass-panel {
+            position: absolute;
+            background: var(--glass-bg);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid var(--glass-border);
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+        }
+
+        #status-panel {
+            top: 20px;
+            left: 20px;
+            width: 300px;
+            z-index: 10;
+        }
+
+        #details-panel {
+            top: 20px;
+            right: 20px;
+            width: 300px;
+            z-index: 10;
+            display: none;
+            transition: opacity 0.3s ease;
+        }
+
+        h1 {
+            font-size: 1.2rem;
+            margin: 0 0 10px 0;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+        }
+
+        p {
+            font-size: 0.9rem;
+            color: var(--text-dim);
+            margin-bottom: 5px;
+        }
+
+        .hash-text {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            color: var(--accent-purple);
+            word-break: break-all;
+            background: rgba(188, 19, 254, 0.1);
+            padding: 4px;
+            border-radius: 4px;
+        }
+
+        button {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--glass-border);
+            color: white;
+            padding: 8px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            margin-top: 10px;
+            margin-right: 5px;
+            transition: all 0.2s;
+            font-size: 0.8rem;
+        }
+
+        button:hover {
+            background: var(--accent-cyan);
+            color: black;
+            box-shadow: 0 0 15px var(--accent-cyan);
+            border-color: var(--accent-cyan);
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+
+        .badge-op {
+            background: rgba(0, 243, 255, 0.2);
+            color: var(--accent-cyan);
+        }
     </style>
 </head>
+
 <body>
-    <div id="overlay">
-        <h2>Aether Logic Grid</h2>
-        <p>Live visualization of stored Logic Atoms.</p>
+
+    <!-- Status Panel -->
+    <div id="status-panel" class="glass-panel">
+        <h1>Aether Logic Grid <span style="font-size:0.6em; opacity:0.5">MONITOR</span></h1>
+        <p id="status-text" style="color: var(--accent-cyan);">Listening for products...</p>
+        <div id="controls">
+            <button onclick="window.cy.layout({name: 'circle', animate: true}).run()">Circle</button>
+            <button onclick="window.cy.layout({name: 'grid', animate: true}).run()">Grid</button>
+            <button
+                onclick="window.cy.layout({name: 'breadthfirst', animate: true, directed: true}).run()">Tree</button>
+            <button onclick="window.cy.fit()">Fit</button>
+        </div>
     </div>
+
+    <!-- Right Details Panel -->
+    <div id="details-panel" class="glass-panel">
+        <h2>Logic Atom</h2>
+        <div id="atom-details">
+            <p>Select a node to inspect its quantum state.</p>
+        </div>
+    </div>
+
     <div id="cy"></div>
+
     <script>
-        fetch('/api/graph').then(res => res.json()).then(data => {
-            const cy = cytoscape({
-                container: document.getElementById('cy'),
-                elements: data,
-                style: [
-                    { 
-                        selector: 'node', 
-                        style: { 
-                            'label': 'data(label)', 
-                            'background-color': '#0074D9', 
-                            'color': '#fff',
-                            'text-valign': 'center',
-                            'text-halign': 'center',
-                            'width': 60,
-                            'height': 60
-                        }
-                    },
-                    { 
-                        selector: 'edge', 
-                        style: { 
-                            'width': 3, 
-                            'line-color': '#39CCCC', 
-                            'target-arrow-color': '#39CCCC', 
-                            'target-arrow-shape': 'triangle', 
-                            'curve-style': 'bezier' 
-                        }
-                    }
-                ],
-                layout: { 
-                    name: 'breadthfirst', 
-                    directed: true, 
-                    padding: 50 
+        const statusText = document.getElementById('status-text');
+        const detailsPanel = document.getElementById('details-panel');
+        const atomDetails = document.getElementById('atom-details');
+
+        // Style Logic
+        const neonStyle = [
+            {
+                selector: 'node',
+                style: {
+                    'label': 'data(shortLabel)',
+                    'font-family': 'Inter',
+                    'font-size': '12px',
+                    'color': '#fff',
+                    'background-color': '#000',
+                    'border-width': 2,
+                    'border-color': '#00f3ff',
+                    'width': 50,
+                    'height': 50,
+                    'text-valign': 'center',
+                    'text-halign': 'center',
+                    'shadow-blur': 15,
+                    'shadow-color': '#00f3ff',
+                    'shadow-opacity': 0.8,
+                    'text-outline-color': '#000',
+                    'text-outline-width': 2
                 }
+            },
+            {
+                selector: 'node[label *= "Op:500"]',
+                style: { 'border-color': '#ff0055', 'shape': 'diamond' }
+            },
+            {
+                selector: 'node[label *= "Op:2"]',
+                style: { 'border-color': '#00ff00', 'shape': 'round-rectangle' }
+            },
+            {
+                selector: 'node[label *= "Op:100"]',
+                style: { 'border-color': '#bc13fe', 'shape': 'octagon' }
+            },
+            {
+                selector: 'edge',
+                style: {
+                    'width': 2,
+                    'line-color': '#444',
+                    'target-arrow-color': '#444',
+                    'target-arrow-shape': 'triangle',
+                    'curve-style': 'bezier'
+                }
+            }
+        ];
+
+        fetch('/api/graph')
+            .then(res => res.json())
+            .then(data => {
+                statusText.innerText = `Active. Tracking ${data.nodes.length} Atoms.`;
+
+                data.nodes.forEach(n => {
+                    const fullLabel = n.data.label;
+                    n.data.shortLabel = fullLabel.replace('Op:', '');
+                    n.data.opCode = fullLabel.split(':')[1];
+                });
+
+                const cy = cytoscape({
+                    container: document.getElementById('cy'),
+                    elements: data,
+                    style: neonStyle,
+                    layout: { name: 'breadthfirst', directed: true, padding: 100, animate: true }
+                });
+
+                cy.on('tap', 'node', function (evt) {
+                    const node = evt.target;
+                    const id = node.id();
+                    const op = node.data('opCode');
+
+                    detailsPanel.style.display = 'block';
+                    atomDetails.innerHTML = `
+                        <div class="badge badge-op">OpCode ${op}</div>
+                        <p><strong>Hash:</strong></p>
+                        <div class="hash-text">${id}</div>
+                    `;
+                    cy.elements().removeClass('highlight');
+                    node.neighborhood().addClass('highlight');
+                });
+
+                cy.on('tap', function (event) {
+                    if (event.target === cy) {
+                        detailsPanel.style.display = 'none';
+                        cy.elements().removeClass('highlight');
+                    }
+                });
+
+                window.cy = cy;
             });
-        });
     </script>
 </body>
+
 </html>
