@@ -22,4 +22,12 @@ impl AetherGuard {
 
         solver.check() == SatResult::Sat
     }
+
+    pub fn verify_sovereignty(&self, endpoint: &str, sensitivity: u8) -> bool {
+        if sensitivity >= 2 {
+            // Law: Sovereign data MUST remain on localhost or .my domains
+            return endpoint.contains("localhost") || endpoint.contains("127.0.0.1") || endpoint.contains(".my");
+        }
+        true
+    }
 }

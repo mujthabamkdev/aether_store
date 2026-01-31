@@ -47,4 +47,25 @@ impl AetherKernel {
         let duration = start.elapsed().as_nanos();
         Ok((result, duration))
     }
+
+    pub async fn execute_io(&self, hash: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let atom = self.vault.fetch(hash).map_err(|e| format!("Vault error: {}", e))?;
+        
+        if atom.op_code == 500 {
+            // 1. Decode the IOContract from atom.data
+            let contract: crate::IOContract = serde_json::from_slice(&atom.data)?;
+
+            // 2. Fetch the data
+            let response = reqwest::get(&contract.endpoint).await?.json::<serde_json::Value>().await?;
+
+            // 3. Validate against the Schema (The 'Guard' of the outside world)
+            let compiled_schema = jsonschema::validator_for(&contract.schema)?;
+            if !compiled_schema.is_valid(&response) {
+                return Err("External data violated the logical schema contract".into());
+            }
+
+            return Ok(response);
+        }
+        Err("Not an I/O Atom (OpCode 500)".into())
+    }
 }

@@ -73,21 +73,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             Err(e) => println!("[Error] Orchestrator failed: {}", e),
         }
+        
+        // --- PHASE 8 I/O DEMO ---
+        println!("\n--- Phase 8: I/O Resonator (Sovereignty Check) ---");
+        let guard = aether_store::AetherGuard::new();
+        
+        // 1. BLOCKED: Sovereign data to foreign domain
+        let foreign_contract = aether_store::IOContract {
+            endpoint: "https://google.com/data".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+            sensitivity: 2, // Sovereign
+        };
+        let foreign_atom = aether_store::LogicAtom {
+            op_code: 500,
+            inputs: vec![],
+            data: serde_json::to_vec(&foreign_contract).unwrap(),
+        };
+        
+        match vault.persist_verified(&foreign_atom, &guard) {
+            Ok(_) => println!("[Warning] Guard FAILED to block foreign sovereign data!"),
+            Err(e) => println!("[Guard] SUCCESS: Blocked foreign sovereign request. Reason: {}", e),
+        }
+        
+        // 2. ALLOWED: Sovereign data to localhost (Our own Logical Grid API)
+        let local_contract = aether_store::IOContract {
+            endpoint: "http://localhost:3000/api/graph".to_string(), // Our own grid
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "nodes": { "type": "array" },
+                    "edges": { "type": "array" }
+                },
+                "required": ["nodes", "edges"]
+            }),
+            sensitivity: 2, // Sovereign
+        };
+        let local_atom = aether_store::LogicAtom {
+            op_code: 500,
+            inputs: vec![],
+            data: serde_json::to_vec(&local_contract).unwrap(),
+        };
+        
+        match vault.persist_verified(&local_atom, &guard) {
+            Ok(io_hash) => {
+                println!("[Guard] Verified Sovereign Local IO. Hash: {}", io_hash);
+                // Note: Kernel execute_io is async. We are in tokio::main, so we can await.
+                println!("[Kernel] Executing Local IO (Fetching Logic Grid Graph)...");
+                match kernel.execute_io(&io_hash).await {
+                    Ok(json) => println!("[Kernel] IO Success! Fetched {} nodes.", json["nodes"].as_array().unwrap().len()),
+                    Err(e) => println!("[Kernel] IO Execution Failed: {}", e),
+                }
+            },
+            Err(e) => println!("[Guard] Blocked valid request? {}", e),
+        }
+
     } else {
         println!("No manifest found. Skipping build.");
     }
 
-    // Start Web Server
-    let user_vault = Arc::clone(&vault);
-    let app = Router::new()
-        .route("/api/graph", get(move || async move { 
-            Json(user_vault.export_graph_json()) 
-        }))
-        .fallback_service(ServeDir::new("static"));
-
-    println!("\n[Logic Grid] Visualization Active: http://localhost:3000");
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
-    axum::serve(listener, app).await?;
+    // Keep main alive to serve
+    println!("\n[System] System is running. Press Ctrl+C to stop.");
+    std::future::pending::<()>().await;
 
     Ok(())
 }

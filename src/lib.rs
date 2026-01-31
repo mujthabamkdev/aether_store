@@ -4,12 +4,14 @@ pub mod loom;
 pub mod manifest;
 pub mod orchestrator;
 pub mod optimizer;
+pub mod io;
 pub use kernel::AetherKernel;
 pub use guard::AetherGuard;
 pub use loom::AetherLoom;
 pub use manifest::AetherManifest;
 pub use orchestrator::AetherOrchestrator;
 pub use optimizer::AetherOptimizer;
+pub use io::IOContract;
 
 use sled::Db;
 use blake3::Hasher;
@@ -70,6 +72,17 @@ impl AetherVault {
         // If it's a financial op, verify 0% Riba
         if atom.op_code == 100 && !guard.verify_interest_free(extract_rate(&atom.data)) {
             return Err(VaultError::Validation("Violation of Genesis Law: Riba Detected".to_string()));
+        }
+        
+        // If it's an IO op, verify sovereignty
+        if atom.op_code == 500 {
+            if let Ok(contract) = serde_json::from_slice::<crate::IOContract>(&atom.data) {
+                 if !guard.verify_sovereignty(&contract.endpoint, contract.sensitivity) {
+                     return Err(VaultError::Validation("Violation of Sovereignty Law: Sovereign data must stay in .my or localhost".to_string()));
+                 }
+            } else {
+                 return Err(VaultError::Validation("Invalid IO Contract data".to_string()));
+            }
         }
         
         Ok(self.persist(atom)?)
