@@ -1,61 +1,40 @@
-use aether_store::{AetherVault, AetherGuard, AetherLoom, AetherKernel};
-use std::io::{self, Write};
+use aether_store::{AetherVault, AetherKernel, AetherOrchestrator};
+use std::fs;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vault = AetherVault::new("aether_db")?;
-    let guard = AetherGuard::new();
-    let loom = AetherLoom::new()?;
-    // Pass a clone of the vault to the kernel so we keep one for persistence
+    // Orchestrator owns Loom and Guard internally now
+    let orchestrator = AetherOrchestrator::new(vault.clone())?;
     let kernel = AetherKernel::new(vault.clone());
 
-    println!("--- Aether Tool v1.0 ---");
-    println!("Describe the logic you want to create (e.g., 'Add 50 and 100', 'Calculate Zakat for 10000'):");
-    print!("> ");
-    io::stdout().flush()?;
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let intent = input.trim();
-
-    if intent.is_empty() {
-        println!("No input provided.");
-        return Ok(());
-    }
-
-    // 1. Weaver: Intent -> Atom
-    println!("\n[Loom] Weaving intent into LogicAtom...");
-    let atom = match loom.weave(intent) {
-        Ok(a) => a,
-        Err(e) => {
-            println!("[Loom] Failed: {}", e);
-            return Ok(());
+    println!("--- Aether Tool v1.0 (Orchestrator Mode) ---");
+    
+    // Check if guardian.yaml exists and load it automatically
+    let manifest_path = "../guardian.yaml";
+    
+    if std::path::Path::new(manifest_path).exists() {
+        println!("Found Manifest: {}", manifest_path);
+        let content = fs::read_to_string(manifest_path)?;
+        
+        match orchestrator.build_app(&content) {
+            Ok(root_hash) => {
+                println!("\n[Success] App Built. Root Hash: {}", root_hash);
+                if !root_hash.is_empty() {
+                    println!("[Kernel] Executing Root Node...");
+                    // We assume root node is executable (OpCode 1) for this demo
+                    match kernel.execute(&root_hash) {
+                        Ok(res) => println!("[Kernel] Root Result: {}", res),
+                        Err(e) => println!("[Kernel] Execution Error (Example: Zakat node might not be executable yet): {}", e),
+                    }
+                }
+            },
+            Err(e) => println!("[Error] Orchestrator failed: {}", e),
         }
-    };
-    println!("[Loom] Created Atom: {:?}", atom);
 
-    // 2. Guard: Atom -> Verified Hash
-    println!("[Guard] Verifying Genesis Laws...");
-    let hash = match vault.persist_verified(&atom, &guard) {
-        Ok(h) => h,
-        Err(e) => {
-            println!("[Guard] BLOCKED: {}", e);
-            return Ok(());
-        }
-    };
-    println!("[Guard] Verified & Persisted. Hash: {}", hash);
-
-    // 3. Kernel: Hash -> Result
-    // Only run if it's executable (OpCode 1). 
-    // Zakat (OpCode 100) logic isn't implemented in Kernel yet, but let's see.
-    if atom.op_code == 1 {
-        println!("[Kernel] Executing logic...");
-        match kernel.execute(&hash) {
-            Ok(res) => println!("[Kernel] Result: {}", res),
-            Err(e) => println!("[Kernel] Execution Error: {}", e),
-        }
     } else {
-        println!("[Kernel] OpCode {} is storage-only for now (or not implemented in execution engine).", atom.op_code);
+        println!("No manifest found at {}. Please create one to use Orchestrator.", manifest_path);
     }
 
     Ok(())
 }
+

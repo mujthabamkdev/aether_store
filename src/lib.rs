@@ -1,9 +1,13 @@
 pub mod kernel;
 pub mod guard;
 pub mod loom;
+pub mod manifest;
+pub mod orchestrator;
 pub use kernel::AetherKernel;
 pub use guard::AetherGuard;
 pub use loom::AetherLoom;
+pub use manifest::AetherManifest;
+pub use orchestrator::AetherOrchestrator;
 
 use sled::Db;
 use blake3::Hasher;
@@ -16,6 +20,8 @@ pub enum VaultError {
     Storage(#[from] sled::Error),
     #[error("Logic node not found")]
     NotFound,
+    #[error("Validation failed: {0}")]
+    Validation(String),
 }
 
 /// The fundamental unit of the Aether-Grid
@@ -58,10 +64,10 @@ impl AetherVault {
         }
     }
 
-    pub fn persist_verified(&self, atom: &LogicAtom, guard: &AetherGuard) -> Result<String, Box<dyn std::error::Error>> {
+    pub fn persist_verified(&self, atom: &LogicAtom, guard: &AetherGuard) -> Result<String, VaultError> {
         // If it's a financial op, verify 0% Riba
         if atom.op_code == 100 && !guard.verify_interest_free(extract_rate(&atom.data)) {
-            return Err("Violation of Genesis Law: Riba Detected".into());
+            return Err(VaultError::Validation("Violation of Genesis Law: Riba Detected".to_string()));
         }
         
         Ok(self.persist(atom)?)
