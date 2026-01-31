@@ -1,27 +1,32 @@
-use aether_store::{AetherVault, LogicAtom, AetherKernel};
+use aether_store::{AetherVault, AetherGuard, LogicAtom};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vault = AetherVault::new("aether_db")?;
-    let kernel = AetherKernel::new(vault);
+    let guard = AetherGuard::new();
 
-    // 1. Define Logic (Add 10 + 20)
-    let mut data = Vec::new();
-    data.extend_from_slice(&10i32.to_le_bytes());
-    data.extend_from_slice(&20i32.to_le_bytes());
-
-    let atom = LogicAtom {
-        op_code: 1, 
+    // 1. Define "Halal" Logic (OpCode 100, Rate 0)
+    let halal_atom = LogicAtom {
+        op_code: 100, 
         inputs: vec![], 
-        data 
+        data: 0i32.to_le_bytes().to_vec()
     };
 
-    // 2. Persist to Warehouse
-    let hash = kernel.vault.persist(&atom)?;
-    println!("Logic persisted with Hash: {}", hash);
+    match vault.persist_verified(&halal_atom, &guard) {
+        Ok(hash) => println!("Halal Atom persisted: {}", hash),
+        Err(e) => println!("Unexpected error: {}", e),
+    }
 
-    // 3. Execute from Hash
-    let result = kernel.execute(&hash)?;
-    println!("Execution Result: {}", result); // Should print 30
+    // 2. Define "Haram" Logic (OpCode 100, Rate 5)
+    let haram_atom = LogicAtom {
+        op_code: 100, 
+        inputs: vec![], 
+        data: 5i32.to_le_bytes().to_vec()
+    };
+
+    match vault.persist_verified(&haram_atom, &guard) {
+        Ok(_) => println!("Error: Riba was allowed!"),
+        Err(e) => println!("Success: The Guard blocked Riba. Reason: {}", e),
+    }
 
     Ok(())
 }

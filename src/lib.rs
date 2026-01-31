@@ -1,5 +1,7 @@
 pub mod kernel;
+pub mod guard;
 pub use kernel::AetherKernel;
+pub use guard::AetherGuard;
 
 use sled::Db;
 use blake3::Hasher;
@@ -52,4 +54,20 @@ impl AetherVault {
             None => Err(VaultError::NotFound),
         }
     }
+
+    pub fn persist_verified(&self, atom: &LogicAtom, guard: &AetherGuard) -> Result<String, Box<dyn std::error::Error>> {
+        // If it's a financial op, verify 0% Riba
+        if atom.op_code == 100 && !guard.verify_interest_free(extract_rate(&atom.data)) {
+            return Err("Violation of Genesis Law: Riba Detected".into());
+        }
+        
+        Ok(self.persist(atom)?)
+    }
+}
+
+fn extract_rate(data: &[u8]) -> i32 {
+    if data.len() < 4 { return 0; }
+    let mut arr = [0u8; 4];
+    arr.copy_from_slice(&data[0..4]);
+    i32::from_le_bytes(arr)
 }
