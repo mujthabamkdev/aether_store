@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Aether Logic Grid</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
+    <style>
+        body { margin: 0; padding: 0; background: #1a1a1a; color: #fff; font-family: sans-serif; }
+        #cy { width: 100vw; height: 100vh; display: block; }
+        #overlay { position: absolute; top: 10px; left: 10px; z-index: 10; background: rgba(0,0,0,0.7); padding: 10px; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <div id="overlay">
+        <h2>Aether Logic Grid</h2>
+        <p>Live visualization of stored Logic Atoms.</p>
+    </div>
+    <div id="cy"></div>
+    <script>
+        fetch('/api/graph').then(res => res.json()).then(data => {
+            const cy = cytoscape({
+                container: document.getElementById('cy'),
+                elements: data,
+                style: [
+                    { 
+                        selector: 'node', 
+                        style: { 
+                            'label': 'data(label)', 
+                            'background-color': '#0074D9', 
+                            'color': '#fff',
+                            'text-valign': 'center',
+                            'text-halign': 'center',
+                            'width': 60,
+                            'height': 60
+                        }
+                    },
+                    { 
+                        selector: 'edge', 
+                        style: { 
+                            'width': 3, 
+                            'line-color': '#39CCCC', 
+                            'target-arrow-color': '#39CCCC', 
+                            'target-arrow-shape': 'triangle', 
+                            'curve-style': 'bezier' 
+                        }
+                    }
+                ],
+                layout: { 
+                    name: 'breadthfirst', 
+                    directed: true, 
+                    padding: 50 
+                }
+            });
+        });
+    </script>
+</body>
+</html>

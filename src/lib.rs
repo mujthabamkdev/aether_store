@@ -72,6 +72,38 @@ impl AetherVault {
         
         Ok(self.persist(atom)?)
     }
+
+    pub fn export_graph_json(&self) -> serde_json::Value {
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+
+        for item in self.db.iter() {
+            if let Ok((key, value)) = item {
+                // Key is bytes, convert to hex string (or utf8 if it was persisted as utf8? Persist used .as_bytes() on utf8 string of hex)
+                // In persist: hash.as_bytes(). Hash is a string of hex. So this is valid utf8.
+                let hash = String::from_utf8_lossy(&key).to_string();
+                
+                if let Ok(atom) = serde_json::from_slice::<LogicAtom>(&value) {
+                    // Add Node
+                    nodes.push(serde_json::json!({
+                        "data": { "id": hash, "label": format!("Op:{}", atom.op_code) }
+                    }));
+
+                    // Add Edges
+                    for input_hash in atom.inputs {
+                        edges.push(serde_json::json!({
+                            "data": { "source": input_hash, "target": hash }
+                        }));
+                    }
+                }
+            }
+        }
+
+        serde_json::json!({
+            "nodes": nodes,
+            "edges": edges
+        })
+    }
 }
 
 fn extract_rate(data: &[u8]) -> i32 {
