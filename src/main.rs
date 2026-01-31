@@ -253,6 +253,7 @@ nodes:
         .route("/api/run_template", post(handle_run_template))
         .route("/api/orchestrate", post(handle_orchestration))
         .route("/api/orchestrate_project", post(handle_orchestrate_project))
+        .route("/api/project_schema", post(handle_get_project_schema))
         .route("/api/execute", post(handle_execution_by_hash))
         .route("/api/projects", get(handle_list_projects))
         .with_state(Arc::clone(&vault))
@@ -274,15 +275,23 @@ struct ExecuteRequest {
 #[derive(Deserialize)]
 struct ProjectRequest {
     name: String,
+    inputs: Option<HashMap<String, String>>,
 }
 
 async fn handle_orchestrate_project(
     State(vault): State<Arc<AetherVault>>,
     Json(payload): Json<ProjectRequest>,
 ) -> Json<OrchestrationResult> {
-    let path = format!("../../products/{}/manifest.yaml", payload.name); // Security risk in prod (path traversal), demo ok
+    let path = format!("../../products/{}/manifest.yaml", payload.name); 
     match fs::read_to_string(&path) {
-        Ok(content) => {
+        Ok(mut content) => {
+             // Templating: Replace {{key}} with value
+             if let Some(inputs) = payload.inputs {
+                 for (k, v) in inputs {
+                     content = content.replace(&format!("{{{{{}}}}}", k), &v);
+                 }
+             }
+
              let orchestrator = AetherOrchestrator::new((*vault).clone()).unwrap(); 
              // Build
              match orchestrator.build_app(&content) {
@@ -335,6 +344,23 @@ async fn handle_list_projects() -> Json<Vec<String>> {
         }
     }
     Json(projects)
+}
+
+#[derive(Deserialize)]
+struct ProjectSchemaRequest {
+    name: String,
+}
+
+async fn handle_get_project_schema(
+    Json(payload): Json<ProjectSchemaRequest>,
+) -> Json<serde_json::Value> {
+    let path = format!("../../products/{}/manifest.yaml", payload.name);
+    if let Ok(content) = fs::read_to_string(&path) {
+        if let Ok(manifest) = serde_yaml::from_str::<aether_store::AetherManifest>(&content) {
+            return Json(serde_json::json!(manifest.inputs));
+        }
+    }
+    Json(serde_json::json!([]))
 }
 
 async fn handle_execution_by_hash(

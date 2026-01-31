@@ -17,9 +17,10 @@ pub struct ManifestNode {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AetherManifest {
     pub app_name: String,
-    pub extends: Option<String>, // Recursion Key
+    pub extends: Option<String>,
+    #[serde(default)]
+    pub inputs: Vec<crate::InputSchema>, // UI Form Def
     #[serde(default)]
     pub imports: Vec<ManifestImport>,
-    // Laws are now handled via Imports/Guard, removed legacy string list
     pub nodes: Vec<ManifestNode>,
 }
