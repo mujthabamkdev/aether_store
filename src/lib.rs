@@ -1,3 +1,6 @@
+pub mod kernel;
+pub use kernel::AetherKernel;
+
 use sled::Db;
 use blake3::Hasher;
 use thiserror::Error;

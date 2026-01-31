@@ -1,28 +1,27 @@
-use aether_store::{AetherVault, LogicAtom};
+use aether_store::{AetherVault, LogicAtom, AetherKernel};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vault = AetherVault::new("aether_db")?;
+    let kernel = AetherKernel::new(vault);
 
-    // Create a sample Logic Atom (e.g., An 'Addition' rule)
+    // 1. Define Logic (Add 10 + 20)
+    let mut data = Vec::new();
+    data.extend_from_slice(&10i32.to_le_bytes());
+    data.extend_from_slice(&20i32.to_le_bytes());
+
     let atom = LogicAtom {
         op_code: 1, 
         inputs: vec![], 
-        data: vec![5, 10] 
+        data 
     };
 
-    // Save to the Warehouse
-    let hash = vault.persist(&atom)?;
-    println!("Atom stored with identity: {}", hash);
+    // 2. Persist to Warehouse
+    let hash = kernel.vault.persist(&atom)?;
+    println!("Logic persisted with Hash: {}", hash);
 
-    // Add a sanity check for deduplication
-    let hash2 = vault.persist(&atom)?;
-    assert_eq!(hash, hash2, "Deduplication failed: hashes should be identical");
-    println!("Deduplication verified: {}", hash2);
-
-    // Retrieve by identity
-    let retrieved = vault.fetch(&hash)?;
-    println!("Successfully retrieved Atom with OpCode: {}", retrieved.op_code);
-    assert_eq!(atom, retrieved, "Retrieval failed: data mismatch");
+    // 3. Execute from Hash
+    let result = kernel.execute(&hash)?;
+    println!("Execution Result: {}", result); // Should print 30
 
     Ok(())
 }
