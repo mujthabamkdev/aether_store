@@ -3,11 +3,13 @@ pub mod guard;
 pub mod loom;
 pub mod manifest;
 pub mod orchestrator;
+pub mod optimizer;
 pub use kernel::AetherKernel;
 pub use guard::AetherGuard;
 pub use loom::AetherLoom;
 pub use manifest::AetherManifest;
 pub use orchestrator::AetherOrchestrator;
+pub use optimizer::AetherOptimizer;
 
 use sled::Db;
 use blake3::Hasher;

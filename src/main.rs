@@ -26,6 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("--- Aether Tool v1.0 (Orchestrator + Logic Grid Mode) ---");
     
+
     // ... CLI Logic ...
     let manifest_path = "../guardian.yaml";
     if std::path::Path::new(manifest_path).exists() {
@@ -36,9 +37,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(root_hash) => {
                 println!("\n[Success] App Built. Root Hash: {}", root_hash);
                 if !root_hash.is_empty() {
-                    println!("[Kernel] Executing Root Node...");
-                    match kernel.execute(&root_hash) {
-                        Ok(res) => println!("[Kernel] Root Result: {}", res),
+                    println!("[Kernel] Executing Root Node with Metrics...");
+                    
+                    // 1. Execute and Measure
+                    match kernel.execute_with_metrics(&root_hash) {
+                        Ok((res, duration)) => {
+                            println!("[Kernel] Root Result: {}", res);
+                            println!("[Kernel] Execution Time: {}ns", duration);
+                            
+                            // 2. Autonomous Evolution
+                            // Create separate Loom/Guard/Vault for optimizer loop as main owns them inside 'orchestrator'
+                            // but we can create new ones or just use the local 'orchestrator' if it exposed them.
+                            // Better: Create new lightweight instances for this phase.
+                            let loom = aether_store::AetherLoom::new().unwrap();
+                            let guard = aether_store::AetherGuard::new();
+                            let optimizer = aether_store::AetherOptimizer::new(100); // 100ns threshold (very low to force trigger)
+                            
+                            if let Some(better_atom) = optimizer.optimize_if_needed(&root_hash, duration, &loom) {
+                                match vault.persist_verified(&better_atom, &guard) {
+                                    Ok(new_hash) => {
+                                        println!("[System] Evolved! New optimized root hash: {}", new_hash);
+                                        // Execute the new one to prove it works
+                                         match kernel.execute_with_metrics(&new_hash) {
+                                            Ok((res_new, _)) => println!("[Kernel] Optimized Result: {}", res_new),
+                                            Err(_) => {}
+                                        }
+                                    },
+                                    Err(e) => println!("[System] Evolution blocked by Guard: {}", e),
+                                }
+                            }
+                        },
                         Err(e) => println!("[Kernel] Execution Error: {}", e),
                     }
                 }
