@@ -15,6 +15,7 @@ struct OrchestrationRequest {
 #[derive(Serialize)]
 struct OrchestrationResult {
     root_hash: String,
+    ui_hint: Option<String>,
     output: serde_json::Value,
     logs: Vec<String>,
 }
@@ -26,8 +27,18 @@ struct RunTemplateRequest {
 }
 
 #[derive(Deserialize)]
-struct InspectQuery {
-    id: String,
+struct TemplateRequest {
+    template: String,
+}
+
+#[derive(Deserialize)]
+struct InspectRequest {
+    format: String, // "json" or "dot"
+}
+
+#[derive(Serialize)]
+struct InspectResult {
+    dot_graph: String,
 }
 
 async fn handle_orchestration(
@@ -35,23 +46,32 @@ async fn handle_orchestration(
     Json(payload): Json<OrchestrationRequest>,
 ) -> Json<OrchestrationResult> {
     
+    // TODO: Extract Identity Hash from Headers
+    // let user_hash = "mock_user_hash";
+    
     // 1. Build the App from the manifest
-    // Since Orchestrator is stateless but needs vault, we create one.
-    // (In real app, we might cache Orchestrators or keep one in State too)
-    let orchestrator = AetherOrchestrator::new((*vault).clone()).unwrap(); // Clone underlying vault (wrapper)
+    let orchestrator = AetherOrchestrator::new((*vault).clone()).unwrap(); 
     
     match orchestrator.build_app(&payload.manifest) {
-        Ok(root_hash) => {
-            // 2. Execute
+        Ok((root_hash, ui_hint)) => {
+            
+            // 2. Verify Resonance (Sovereign Gate)
+            // In a real implementation, we check if the user has permission to EXECUTE this root hash.
+            // For now, we assume if they can build it, they can run it (Architect Mode).
+            // if !vault.verify_resonance(user_hash, &root_hash) { ... }
+
+            // 3. Execute
             let kernel = AetherKernel::new((*vault).clone());
             match kernel.execute_smart(&root_hash).await {
                 Ok(result) => Json(OrchestrationResult {
                     root_hash,
+                    ui_hint,
                     output: result,
                     logs: vec!["Execution Successful".to_string()]
                 }),
                 Err(e) => Json(OrchestrationResult {
                     root_hash,
+                    ui_hint: None,
                     output: serde_json::json!({"error": e.to_string()}),
                     logs: vec![format!("Execution Error: {}", e)]
                 })
@@ -59,23 +79,11 @@ async fn handle_orchestration(
         },
         Err(e) => Json(OrchestrationResult {
             root_hash: String::new(),
+            ui_hint: None,
             output: serde_json::json!({"error": e.to_string()}),
             logs: vec![format!("Build Error: {}", e)]
         })
     }
-}
-
-async fn handle_inspect(
-    Query(query): Query<InspectQuery>,
-) -> Json<serde_json::Value> {
-    let catalog_path = "../catalog.json";
-    if let Ok(content) = fs::read_to_string(catalog_path) {
-        let catalog: HashMap<String, ProductTemplate> = serde_json::from_str(&content).unwrap_or_default();
-        if let Some(product) = catalog.get(&query.id) {
-             return Json(serde_json::json!(product));
-        }
-    }
-    Json(serde_json::json!({"error": "Product not found"}))
 }
 
 async fn handle_run_template(
@@ -97,16 +105,18 @@ async fn handle_run_template(
         // Build & Run
         let orchestrator = AetherOrchestrator::new((*vault).clone()).unwrap();
          match orchestrator.build_app(&manifest) {
-            Ok(root_hash) => {
+            Ok((root_hash, ui_hint)) => {
                 let kernel = AetherKernel::new((*vault).clone());
                 match kernel.execute_smart(&root_hash).await {
                     Ok(result) => Json(OrchestrationResult {
                         root_hash,
+                        ui_hint,
                         output: result,
                         logs: vec!["Template Executed".to_string()]
                     }),
                     Err(e) => Json(OrchestrationResult {
                         root_hash,
+                        ui_hint: None,
                         output: serde_json::json!({"error": e.to_string()}),
                         logs: vec![format!("Execution Error: {}", e)]
                     })
@@ -114,6 +124,7 @@ async fn handle_run_template(
             },
             Err(e) => Json(OrchestrationResult {
                 root_hash: String::new(),
+                ui_hint: None,
                 output: serde_json::json!({"error": e.to_string()}),
                 logs: vec![format!("Build Error: {}", e)]
             })
@@ -121,10 +132,26 @@ async fn handle_run_template(
     } else {
         Json(OrchestrationResult {
             root_hash: String::new(),
+            ui_hint: None,
             output: serde_json::json!({"error": "Product ID not found"}),
             logs: vec!["Catalog Error".to_string()]
         })
     }
+}
+
+async fn handle_inspect(
+    State(vault): State<Arc<AetherVault>>,
+    Json(payload): Json<InspectRequest>,
+) -> Json<InspectResult> {
+    let result = if payload.format == "json" {
+        vault.export_graph_json().to_string()
+    } else {
+        vault.export_graph_viz()
+    };
+    
+    Json(InspectResult {
+        dot_graph: result
+    })
 }
 
 #[tokio::main]
@@ -253,6 +280,7 @@ nodes:
         .route("/api/run_template", post(handle_run_template))
         .route("/api/orchestrate", post(handle_orchestration))
         .route("/api/orchestrate_project", post(handle_orchestrate_project))
+        .route("/api/deploy", post(handle_deploy))
         .route("/api/project_schema", post(handle_get_project_schema))
         .route("/api/execute", post(handle_execution_by_hash))
         .route("/api/projects", get(handle_list_projects))
@@ -295,17 +323,19 @@ async fn handle_orchestrate_project(
              let orchestrator = AetherOrchestrator::new((*vault).clone()).unwrap(); 
              // Build
              match orchestrator.build_app(&content) {
-                Ok(root_hash) => {
+                Ok((root_hash, ui_hint)) => {
                      // Exec
                     let kernel = AetherKernel::new((*vault).clone());
                     match kernel.execute_smart(&root_hash).await {
                         Ok(result) => Json(OrchestrationResult {
                             root_hash,
+                            ui_hint,
                             output: result,
                             logs: vec![format!("Project '{}' Build & Exec Successful", payload.name)]
                         }),
                         Err(e) => Json(OrchestrationResult {
                             root_hash,
+                            ui_hint: None,
                             output: serde_json::json!({"error": e.to_string()}),
                             logs: vec![format!("Execution Error: {}", e)]
                         })
@@ -313,6 +343,7 @@ async fn handle_orchestrate_project(
                 },
                 Err(e) => Json(OrchestrationResult {
                      root_hash: String::new(),
+                     ui_hint: None,
                      output: serde_json::json!({"error": e.to_string()}),
                      logs: vec![format!("Build Error: {}", e)]
                 })
@@ -320,10 +351,44 @@ async fn handle_orchestrate_project(
         },
         Err(e) => Json(OrchestrationResult {
              root_hash: String::new(),
+             ui_hint: None,
              output: serde_json::json!({"error": e.to_string()}),
              logs: vec![format!("Manifest Read Error: {}", e)]
         })
     }
+}
+
+#[derive(Serialize)]
+struct DeployResult {
+    app_url: String,
+    root_hash: String,
+}
+
+async fn handle_deploy(
+    State(vault): State<Arc<AetherVault>>,
+    Json(payload): Json<ProjectRequest>,
+) -> Json<DeployResult> {
+    // 1. Build & Orchestrate to freeze logic
+    let path = format!("../../products/{}/manifest.yaml", payload.name); 
+    if let Ok(mut content) = fs::read_to_string(&path) {
+         if let Some(inputs) = payload.inputs {
+             for (k, v) in inputs {
+                 content = content.replace(&format!("{{{{{}}}}}", k), &v);
+             }
+         }
+         
+         let orchestrator = AetherOrchestrator::new((*vault).clone()).unwrap();
+         if let Ok((root_hash, _)) = orchestrator.build_app(&content) {
+             return Json(DeployResult {
+                 app_url: format!("http://localhost:3000/?app={}", root_hash),
+                 root_hash,
+             });
+         }
+    }
+    Json(DeployResult {
+        app_url: "error".to_string(),
+        root_hash: "error".to_string()
+    })
 }
 
 async fn handle_list_projects() -> Json<Vec<String>> {
@@ -371,11 +436,14 @@ async fn handle_execution_by_hash(
     match kernel.execute_smart(&payload.hash).await {
          Ok(result) => Json(OrchestrationResult {
             root_hash: payload.hash,
+            ui_hint: None, // Logic Execution doesn't re-parse manifest, so hint is lost unless stored in Atom?
+            // For now, raw execution has no hint.
             output: result,
             logs: vec!["Executed from Registry".to_string()]
         }),
         Err(e) => Json(OrchestrationResult {
             root_hash: payload.hash,
+            ui_hint: None,
             output: serde_json::json!({"error": e.to_string()}),
             logs: vec![format!("Execution Error: {}", e)]
         })

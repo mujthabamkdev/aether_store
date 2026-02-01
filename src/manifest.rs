@@ -6,11 +6,13 @@ pub struct ManifestImport {
     pub hash: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ManifestNode {
     pub name: String,
     pub intent: Option<String>, // Optional if using existing logic
     pub use_ref: Option<String>, // Reference to an imported name
+    pub ui_hint: Option<String>, // New Field: "Dashboard", "Card", "Table", etc.
+    #[serde(default)]
     pub dependencies: Vec<String>,
 }
 

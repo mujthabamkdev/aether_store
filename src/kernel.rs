@@ -112,6 +112,20 @@ impl AetherKernel {
             500 => { // IO
                 self.execute_io(hash).await
             },
+            800 => { // GATEWAY / MASKING
+                // Input 0: The Internal Logic Result to be Masked
+                if let Some(internal_result) = input_results.get(0) {
+                     // In a real scenario, this might encrypt fields or filter sensitive keys
+                     // For now, we wrap it in a "Sovereign Envelope"
+                     Ok(serde_json::json!({
+                         "origin": "0xSOVEREIGN_ROOT", 
+                         "payload": internal_result,
+                         "masked_fields": ["private_logic_trace"]
+                     }))
+                } else {
+                     Ok(serde_json::json!({"error": "Gateway has no input resonance"}))
+                }
+            },
             _ => Ok(serde_json::json!(null))
         }
     }

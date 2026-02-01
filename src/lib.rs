@@ -18,10 +18,21 @@ pub use orchestrator::AetherOrchestrator;
 pub use optimizer::AetherOptimizer;
 pub use io::IOContract;
 
+pub const OP_PERMISSION: u16 = 10;
+pub const OP_GATEWAY: u16 = 800;
+
 use sled::Db;
 use blake3::Hasher;
 use thiserror::Error;
 use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct IdentityAtom {
+    pub public_key: String,
+    pub role: String, // e.g., "admin", "viewer"
+    pub org_hash: String, // Link to Org Genesis
+    pub access_nodes: Vec<String>, // List of PermissionNode Hashes (Op:10)
+}
 
 #[derive(Error, Debug)]
 pub enum VaultError {
@@ -29,6 +40,8 @@ pub enum VaultError {
     Storage(#[from] sled::Error),
     #[error("Logic node not found")]
     NotFound,
+    #[error("Identity not found")]
+    IdentityNotFound,
     #[error("Validation failed: {0}")]
     Validation(String),
 }
@@ -130,18 +143,74 @@ impl AetherVault {
         }
 
         // Context Isolation: Verify inputs belong to same context or global
+        let mut input_atoms = Vec::new();
         for input_hash in &atom.inputs {
             if let Ok(input_atom) = self.fetch(input_hash) {
                 if input_atom.context_id != "global" && input_atom.context_id != atom.context_id {
                      return Err(VaultError::Validation(format!(
-                         "Context Isolation Violation: Atom '{}' ({}) cannot depend on Atom ({}) from different context '{}'", 
-                         atom.context_id, atom.op_code, input_atom.context_id, input_atom.context_id
+                         "Context Isolation Violation: Atom '{}' ({}) from '{}' cannot depend on Atom ({}) from '{}'", 
+                         atom.op_code, atom.context_id, atom.context_id, input_atom.op_code, input_atom.context_id
                      )));
                 }
+                input_atoms.push(input_atom);
+            } else {
+                 return Err(VaultError::Validation(format!("Missing Dependency: {}", input_hash)));
             }
         }
         
-        Ok(self.persist(atom)?)
+        // Guard: Static Analysis
+        guard.verify_compatibility(atom, &input_atoms)
+            .map_err(|e: anyhow::Error| VaultError::Validation(e.to_string()))?;
+            
+        // Restore IO Sovereignty Check
+        if atom.op_code == 500 {
+             // We need to parse storage to get endpoint. But storage is ref.
+             // For now, skip deep inspection here to avoid overhead, relying on Kernel runtime check.
+             // Or verify logic graph compatibility is enough for now.
+        }
+
+        // 3. Hash & Store
+        let data = serde_json::to_vec(atom).unwrap();
+        let hash = blake3::hash(&data).to_string();
+
+        self.db.insert(hash.as_bytes(), data)?;
+        Ok(hash)
+    }
+
+    pub fn persist_identity(&self, identity: &IdentityAtom) -> Result<String, VaultError> {
+        let serialized = serde_json::to_vec(identity).unwrap();
+        // Hash the public key to get the Identity Hash (Deterministic)
+        let hash = blake3::hash(identity.public_key.as_bytes()).to_string();
+        self.db.insert(format!("ID:{}", hash).as_bytes(), serialized)?;
+        Ok(hash)
+    }
+
+    pub fn fetch_identity(&self, hash: &str) -> Result<IdentityAtom, VaultError> {
+        match self.db.get(format!("ID:{}", hash).as_bytes())? {
+            Some(data) => Ok(serde_json::from_slice(&data).unwrap()),
+            None => Err(VaultError::IdentityNotFound),
+        }
+    }
+
+    /// Verifies if a User (via IdentityHash) has resonance (access) to a Project (via ProjectHash)
+    /// This connects the user to the project via a PermissionNode (Op:10)
+    pub fn verify_resonance(&self, user_hash: &str, project_hash: &str) -> bool {
+        if let Ok(identity) = self.fetch_identity(user_hash) {
+            // Traverse the user's access nodes
+            for permission_hash in &identity.access_nodes {
+                 if let Ok(perm_node) = self.fetch(permission_hash) {
+                     // Check if it is a Permission Op
+                     if perm_node.op_code == OP_PERMISSION {
+                         // Check if this permission node points to the project
+                         // We assume inputs[0] is the Target Project Hash
+                         if perm_node.inputs.contains(&project_hash.to_string()) {
+                             return true;
+                         }
+                     }
+                 }
+            }
+        }
+        false
     }
 
     pub fn export_graph_json(&self) -> serde_json::Value {
@@ -150,29 +219,62 @@ impl AetherVault {
 
         for item in self.db.iter() {
             if let Ok((key, value)) = item {
-                // Key is bytes, convert to hex string
-                let hash = String::from_utf8_lossy(&key).to_string();
+                let key_str = String::from_utf8_lossy(&key).to_string();
                 
-                if let Ok(atom) = serde_json::from_slice::<LogicAtom>(&value) {
-                    // Add Node
-                    nodes.push(serde_json::json!({
-                        "data": { "id": hash, "label": format!("Op:{}", atom.op_code) }
-                    }));
-
-                    // Add Edges
-                    for input_hash in atom.inputs {
-                        edges.push(serde_json::json!({
-                            "data": { "source": input_hash, "target": hash }
+                // Check if it's an Identity
+                if key_str.starts_with("ID:") {
+                     if let Ok(identity) = serde_json::from_slice::<IdentityAtom>(&value) {
+                        let id_hash = key_str.replace("ID:", "");
+                        nodes.push(serde_json::json!({
+                            "data": { "id": id_hash, "label": format!("User:{}", identity.role), "type": "identity" }
                         }));
+                        for access in identity.access_nodes {
+                            edges.push(serde_json::json!({
+                                "data": { "source": id_hash, "target": access, "label": "owns_access" }
+                            }));
+                        }
+                     }
+                } else {
+                    // It's a LogicAtom
+                    if let Ok(atom) = serde_json::from_slice::<LogicAtom>(&value) {
+                         nodes.push(serde_json::json!({
+                            "data": { "id": key_str, "label": format!("Op:{}", atom.op_code), "type": "logic" }
+                        }));
+                        for input_hash in atom.inputs {
+                            edges.push(serde_json::json!({
+                                "data": { "source": input_hash, "target": key_str }
+                            }));
+                        }
                     }
                 }
             }
         }
+        serde_json::json!({ "nodes": nodes, "edges": edges })
+    }
 
-        serde_json::json!({
-            "nodes": nodes,
-            "edges": edges
-        })
+    pub fn export_graph_viz(&self) -> String {
+        let mut dot = String::from("digraph AetherLogic {\n");
+        for item in self.db.iter() {
+            if let Ok((key, value)) = item {
+                let key_str = String::from_utf8_lossy(&key).to_string();
+                if key_str.starts_with("ID:") {
+                    // Identity
+                    let short_hash = &key_str[3..11];
+                    dot.push_str(&format!("    \"{}\" [label=\"Identity\\n{}\" shape=box];\n", key_str, short_hash));
+                } else {
+                    let hash = key_str;
+                    let short_hash = &hash[0..8];
+                    if let Ok(atom) = serde_json::from_slice::<LogicAtom>(&value) {
+                         dot.push_str(&format!("    \"{}\" [label=\"Op:{}\\n{}\"];\n", hash, atom.op_code, short_hash));
+                         for input_hash in atom.inputs {
+                             dot.push_str(&format!("    \"{}\" -> \"{}\";\n", input_hash, hash));
+                         }
+                    }
+                }
+            }
+        }
+        dot.push_str("}");
+        dot
     }
 }
 

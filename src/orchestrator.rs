@@ -17,7 +17,7 @@ impl AetherOrchestrator {
         })
     }
 
-    pub fn build_app(&self, manifest_raw: &str) -> Result<String> {
+    pub fn build_app(&self, manifest_raw: &str) -> Result<(String, Option<String>)> {
         let manifest: AetherManifest = serde_yaml::from_str(manifest_raw)
             .context("Failed to parse manifest YAML")?;
         
@@ -28,10 +28,10 @@ impl AetherOrchestrator {
             println!("[Orchestrator] Recursion: '{}' extends '{}'", final_manifest.app_name, parent_name);
             let parent_path = format!("../../products/{}/manifest.yaml", parent_name);
             let parent_raw = std::fs::read_to_string(&parent_path)
-                .with_context(|| format!("Failed to read parent manifest at '{}'", parent_path))?;
+                .context("Msg")?;
             
             let parent: AetherManifest = serde_yaml::from_str(&parent_raw)
-                .context("Failed to parse parent manifest")?;
+                .context("Msg")?;
                 
             // Merge Strategies
             // 1. Imports: Child overrides Parent (if duplicates, though vec doesn't map, so we append unique?)
@@ -60,23 +60,25 @@ impl AetherOrchestrator {
         }
 
         let mut node_map: HashMap<String, String> = HashMap::new();
+        let mut root_hint: Option<String> = None;
 
         for node in final_manifest.nodes {
             println!("[Orchestrator] Processing Node: '{}'", node.name);
+            if node.name == "root" {
+                root_hint = node.ui_hint.clone();
+            }
             
             // 1. Resolve Logic: Intent (New) vs use_ref (Linked)
             let mut atom = if let Some(ref intent) = node.intent {
                 // Generative Mode: Ask Loom (Use Manifest App Name as Context)
-                 self.loom.weave_with_context(intent, &final_manifest.app_name)
-                    .with_context(|| format!("Failed to weave node '{}'", node.name))?
+                 self.loom.weave_with_context(intent, &final_manifest.app_name)?
             } else if let Some(ref ref_name) = node.use_ref {
                 // Linker Mode: Fetch from Registry/Vault
                 if let Some(hash) = import_map.get(ref_name) {
                     println!("[Orchestrator] Linking to Master Atom: {} -> {}", ref_name, hash);
                     // Fetch the master atom to use as a template
                     // We need to clone it because we will modify its inputs (dependencies)
-                    let master_atom = self.vault.fetch(hash)
-                        .with_context(|| format!("Failed to fetch imported atom '{}' ({})", ref_name, hash))?;
+                    let master_atom = self.vault.fetch(hash)?;
                     
                     // Create a new instance (same logic/data, new inputs)
                     // Context ID: Keep the Master's Context (e.g., "global") or override?
@@ -96,7 +98,7 @@ impl AetherOrchestrator {
                         context_id: final_manifest.app_name.clone(),
                     }
                 } else {
-                    return Err(anyhow::anyhow!("Import reference '{}' not found in manifest imports", ref_name));
+                    return Err(anyhow::anyhow!("Import not found"));
                 }
             } else {
                 return Err(anyhow::anyhow!("Node '{}' must have either 'intent' or 'use_ref'", node.name));
@@ -121,11 +123,12 @@ impl AetherOrchestrator {
 
         // Return the Root Hash of the Application
         match node_map.get("root") {
-            Some(h) => Ok(h.clone()),
+            Some(h) => Ok((h.clone(), root_hint)),
             None => {
                 // Return the last one if 'root' is not defined, explicitly for demo purposes
                 // or just an empty string if nothing processed.
-                 Ok(node_map.values().last().cloned().unwrap_or_default())
+                 let last = node_map.values().last().cloned().unwrap_or_default();
+                 Ok((last, root_hint))
             }
         }
     }
