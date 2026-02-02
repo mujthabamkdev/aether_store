@@ -1,6 +1,7 @@
-use aether_store::{AetherVault, AetherKernel, AetherOrchestrator, ProductTemplate, InputSchema};
+use aether_store::{AetherVault, AetherKernel, AetherOrchestrator, ProductTemplate, InputSchema, ProjectAtom, ProjectStatus};
 use std::fs;
 use std::sync::Arc;
+use std::env;
 use axum::{Router, routing::{get, post}, Json, extract::{State, Query}, http::Method};
 use tower_http::{services::ServeDir, cors::{CorsLayer, Any}};
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,34 @@ struct TemplateRequest {
 #[derive(Deserialize)]
 struct InspectRequest {
     format: String, // "json" or "dot"
+}
+
+#[derive(Deserialize)]
+struct ChatRequest {
+    project: String,
+    hash: Option<String>,
+    message: String,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+struct LogicNodePatch {
+    name: String,
+    intent: String,
+    dependencies: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ManifestPatch {
+    add_nodes: Option<Vec<LogicNodePatch>>,
+    modify_nodes: Option<Vec<LogicNodePatch>>,
+    remove_nodes: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct WeaveRequest {
+    project: String,
+    current_hash: Option<String>,
+    patch: ManifestPatch,
 }
 
 #[derive(Serialize)]
@@ -156,6 +185,9 @@ async fn handle_inspect(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load environment variables from .env file
+    dotenvy::dotenv().ok();
+    
     let vault = Arc::new(AetherVault::new("aether_db")?);
     // Orchestrator owns Loom and Guard internally now
     // Since vault is Arc, we can try to clone or make Orchestrator accept Arc
@@ -258,6 +290,62 @@ nodes:
         fs::write(catalog_path, json).unwrap();
     }
 
+    // --- MIGRATION & REPAIR ---
+    println!("[System] Verifying Project Registry...");
+    if let Ok(projects) = vault.list_projects() {
+        if projects.is_empty() {
+             println!("[Migration] Registry empty. Scanning filesystem...");
+             // ... (Existing Migration Logic - can be simplified or merged) ...
+             let projects_dir = "../../products"; 
+             if let Ok(entries) = fs::read_dir(projects_dir) {
+                 for entry in entries {
+                     if let Ok(entry) = entry {
+                         if entry.path().is_dir() {
+                             if let Ok(name) = entry.file_name().into_string() {
+                                 // Register as legacy first, let repair logic handle build
+                                 println!("[Migration] Discovered: {}", name);
+                                 let atom = aether_store::ProjectAtom {
+                                     name: name.clone(),
+                                     root_hash: "legacy_fs_root".to_string(), 
+                                     org_hash: "global".to_string(),
+                                     status: aether_store::ProjectStatus::Active,
+                                     created_at: 0,
+                                 };
+                                 let _ = vault.persist_project(&atom);
+                             }
+                         }
+                     }
+                 }
+             }
+        }
+    }
+
+    // REPAIR PASS: Fix any "legacy_fs_root" projects
+    if let Ok(projects) = vault.list_projects() {
+        for mut proj in projects {
+            if proj.root_hash == "legacy_fs_root" {
+                println!("[Repair] Project '{}' needs logic build...", proj.name);
+                let manifest_path = format!("../../products/{}/manifest.yaml", proj.name);
+                
+                if let Ok(content) = fs::read_to_string(&manifest_path) {
+                    if let Ok(orchestrator) = AetherOrchestrator::new(vault.as_ref().clone()) {
+                        match orchestrator.build_app(&content) {
+                            Ok((hash, _)) => {
+                                println!("[Repair] Built '{}' -> Root Hash: {}", proj.name, hash);
+                                proj.root_hash = hash;
+                                proj.status = aether_store::ProjectStatus::Active;
+                                let _ = vault.persist_project(&proj);
+                            },
+                            Err(e) => println!("[Repair] Failed to build '{}': {}", proj.name, e),
+                        }
+                    }
+                } else {
+                    println!("[Repair] Manifest missing for '{}'", proj.name);
+                }
+            }
+        }
+    }
+
     // --- Start Web Server ---
     let user_vault = Arc::clone(&vault);
     
@@ -284,6 +372,8 @@ nodes:
         .route("/api/project_schema", post(handle_get_project_schema))
         .route("/api/execute", post(handle_execution_by_hash))
         .route("/api/projects", get(handle_list_projects))
+        .route("/api/chat", post(handle_chat))
+        .route("/api/project/weave", post(handle_weave))
         .with_state(Arc::clone(&vault))
         .layer(cors)
         .fallback_service(ServeDir::new("../universal_shell"));
@@ -310,6 +400,17 @@ async fn handle_orchestrate_project(
     State(vault): State<Arc<AetherVault>>,
     Json(payload): Json<ProjectRequest>,
 ) -> Json<OrchestrationResult> {
+    // 1. Initial Status: Building
+    let project_atom = ProjectAtom {
+        name: payload.name.clone(),
+        root_hash: String::new(),
+        org_hash: "legacy_org".to_string(),
+        status: ProjectStatus::Building,
+        created_at: 0,
+    };
+    let _ = vault.persist_project(&project_atom); // Persist Initial State
+
+    // 2. Load Manifest (Currently FS, future Sled)
     let path = format!("../../products/{}/manifest.yaml", payload.name); 
     match fs::read_to_string(&path) {
         Ok(mut content) => {
@@ -324,6 +425,20 @@ async fn handle_orchestrate_project(
              // Build
              match orchestrator.build_app(&content) {
                 Ok((root_hash, ui_hint)) => {
+                     // 3. Update Status: Active
+                     let _ = vault.update_project_status(&payload.name, ProjectStatus::Active);
+                     // Update Root Hash in separate atomic op or refetch-modify-save (Simplified here)
+                     // Ideally persist_project should be upsert. 
+                     // For now, re-save with Hash
+                     let final_atom = ProjectAtom {
+                        name: payload.name.clone(),
+                        root_hash: root_hash.clone(),
+                        org_hash: "legacy_org".to_string(),
+                        status: ProjectStatus::Active,
+                        created_at: 0,
+                     };
+                     let _ = vault.persist_project(&final_atom);
+
                      // Exec
                     let kernel = AetherKernel::new((*vault).clone());
                     match kernel.execute_smart(&root_hash).await {
@@ -391,24 +506,16 @@ async fn handle_deploy(
     })
 }
 
-async fn handle_list_projects() -> Json<Vec<String>> {
-    let projects_dir = "../../products"; // Relative to warehouse/engine
-    let mut projects = Vec::new();
-
-    if let Ok(entries) = fs::read_dir(projects_dir) {
-        for entry in entries {
-             if let Ok(entry) = entry {
-                 if let Ok(file_type) = entry.file_type() {
-                     if file_type.is_dir() {
-                         if let Ok(name) = entry.file_name().into_string() {
-                             projects.push(name);
-                         }
-                     }
-                 }
-             }
-        }
+async fn handle_list_projects(
+    State(vault): State<Arc<AetherVault>>,
+) -> Json<Vec<ProjectAtom>> {
+    // 1. Fetch from Sled (Source of Truth)
+    if let Ok(projects) = vault.list_projects() {
+        return Json(projects);
     }
-    Json(projects)
+    
+    // Fallback? Or just empty.
+    Json(Vec::new())
 }
 
 #[derive(Deserialize)]
@@ -422,10 +529,13 @@ async fn handle_get_project_schema(
     let path = format!("../../products/{}/manifest.yaml", payload.name);
     if let Ok(content) = fs::read_to_string(&path) {
         if let Ok(manifest) = serde_yaml::from_str::<aether_store::AetherManifest>(&content) {
-            return Json(serde_json::json!(manifest.inputs));
+            return Json(serde_json::json!({
+                "app_name": manifest.app_name,
+                "inputs": manifest.inputs
+            }));
         }
     }
-    Json(serde_json::json!([]))
+    Json(serde_json::json!({"app_name": payload.name, "inputs": []}))
 }
 
 async fn handle_execution_by_hash(
@@ -448,5 +558,308 @@ async fn handle_execution_by_hash(
             logs: vec![format!("Execution Error: {}", e)]
         })
     }
+}
+
+async fn handle_chat(
+    Json(payload): Json<ChatRequest>,
+) -> Json<serde_json::Value> {
+    // Read project manifest for context
+    let manifest_path = format!("../../products/{}/manifest.yaml", payload.project);
+    let manifest_info = fs::read_to_string(&manifest_path).unwrap_or_default();
+    
+    // Build system prompt (shared by all APIs)
+    let system_prompt = format!(r#"You are the Resident Architect for the '{}' project. Your job is to analyze user requests and generate manifest patches to modify the project's logic.
+
+CURRENT MANIFEST:
+```yaml
+{}
+```
+
+AVAILABLE NODE OPERATIONS:
+1. ADD nodes - create new logic nodes with name, intent, and dependencies
+2. MODIFY nodes - change existing node intent or dependencies  
+3. REMOVE nodes - delete nodes by name
+
+RESPONSE FORMAT:
+If the user wants to modify the project logic (add features, fix bugs, add data sources, etc.), respond with JSON:
+{{
+  "mode": "WEAVE",
+  "response": "Brief explanation of what you'll do",
+  "patch": {{
+    "add_nodes": [{{ "name": "node_name", "intent": "what it does", "dependencies": ["parent_node"] }}],
+    "modify_nodes": [{{ "name": "existing_node", "intent": "new intent", "dependencies": ["deps"] }}],
+    "remove_nodes": ["node_to_remove"]
+  }}
+}}
+
+If the user is just asking questions (explain, what is, how does), respond with JSON:
+{{
+  "mode": "CHAT",
+  "response": "Your helpful explanation"
+}}
+
+IMPORTANT:
+- For data scraping requests, add a node with intent describing the scraping task
+- For optimization, modify existing nodes or add caching nodes
+- For new features, add appropriate nodes with clear intents
+- Always include at least one dependency (use "root" or "fetch_data" if unsure)
+- Keep node names lowercase with underscores
+- Be concise but helpful in your response"#, payload.project, manifest_info.chars().take(2000).collect::<String>());
+
+    let client = reqwest::Client::new();
+    let user_message = payload.message.clone();
+    let project_name = payload.project.clone();
+    
+    // 1. Try OpenRouter (Primary)
+    if let Ok(or_key) = env::var("OPENROUTER_API_KEY") {
+        println!("[AI] Trying OpenRouter API...");
+        if let Some(result) = try_openrouter(&client, &or_key, &system_prompt, &user_message, &project_name).await {
+            return Json(result);
+        }
+        println!("[AI Warning] OpenRouter failed, falling back...");
+    }
+
+    // 2. Try Gemini (Fallback)
+    if let Ok(gemini_key) = env::var("GEMINI_API_KEY") {
+        println!("[AI] Trying Gemini API...");
+        if let Some(result) = try_gemini(&client, &gemini_key, &system_prompt, &user_message, &project_name).await {
+            return Json(result);
+        }
+    }
+    
+    // All APIs failed
+    println!("[AI Error] All API keys exhausted or failed");
+    Json(serde_json::json!({
+        "mode": "CHAT",
+        "response": "⚠️ All AI APIs are unavailable. Please check your API keys or try again later.",
+        "project": project_name
+    }))
+}
+
+async fn try_openrouter(
+    client: &reqwest::Client,
+    api_key: &str,
+    system_prompt: &str,
+    user_message: &str,
+    project_name: &str,
+) -> Option<serde_json::Value> {
+    let body = serde_json::json!({
+        "model": "google/gemini-2.0-flash-001", // Specific model
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ],
+        "temperature": 0.7,
+        "max_tokens": 2000
+    });
+    
+    // Debug
+    println!("[OpenRouter] Sending request for project: {}", project_name);
+
+    let response = client.post("https://openrouter.ai/api/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("HTTP-Referer", "http://localhost:3000")
+        .header("X-Title", "Aether Engine")
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .ok()?;
+    
+    let text = response.text().await.ok()?;
+    // Debug raw response
+    println!("[OpenRouter] Raw response len: {}", text.len());
+    
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    
+    // Check for errors
+    if json.get("error").is_some() {
+        println!("[OpenRouter] Error: {}", json["error"]["message"].as_str().unwrap_or("Unknown"));
+        return None;
+    }
+    
+    let ai_text = json["choices"][0]["message"]["content"].as_str()?;
+    if ai_text.trim().is_empty() {
+        println!("[OpenRouter] Error: Empty response text");
+        return None;
+    }
+    
+    println!("[OpenRouter] Success! Response: {}...", ai_text.chars().take(100).collect::<String>());
+    
+    Some(parse_ai_response(ai_text, project_name))
+}
+
+fn parse_ai_response(ai_text: &str, project_name: &str) -> serde_json::Value {
+    // Try to find JSON in the response
+    let json_start = ai_text.find('{');
+    let json_end = ai_text.rfind('}');
+    
+    if let (Some(start), Some(end)) = (json_start, json_end) {
+        let json_str = &ai_text[start..=end];
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+            let mode = parsed["mode"].as_str().unwrap_or("CHAT");
+            let response = parsed["response"].as_str().unwrap_or("").to_string();
+            
+            if mode == "WEAVE" && parsed.get("patch").is_some() {
+                return serde_json::json!({
+                    "mode": "WEAVE",
+                    "response": response,
+                    "patch": parsed["patch"],
+                    "project": project_name
+                });
+            } else {
+                return serde_json::json!({
+                    "mode": "CHAT",
+                    "response": response,
+                    "project": project_name
+                });
+            }
+        }
+    }
+    
+    // Return as plain text
+    serde_json::json!({
+        "mode": "CHAT",
+        "response": ai_text,
+        "project": project_name
+    })
+}
+
+async fn try_gemini(
+    client: &reqwest::Client,
+    api_key: &str,
+    system_prompt: &str,
+    user_message: &str,
+    project_name: &str,
+) -> Option<serde_json::Value> {
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={}",
+        api_key
+    );
+    
+    let body = serde_json::json!({
+        "contents": [{
+            "parts": [{"text": format!("{}\n\nUser request: {}", system_prompt, user_message)}]
+        }],
+        "generationConfig": {"temperature": 0.7, "topP": 0.95, "maxOutputTokens": 1024}
+    });
+    
+    let response = client.post(&url).json(&body).send().await.ok()?;
+    let text = response.text().await.ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    
+    // Check for errors
+    if json.get("error").is_some() {
+        let code = json["error"]["code"].as_i64().unwrap_or(0);
+        println!("[Gemini] Error {}: {}", code, json["error"]["message"].as_str().unwrap_or("Unknown"));
+        return None;
+    }
+    
+    let ai_text = json["candidates"][0]["content"]["parts"][0]["text"].as_str()?;
+    println!("[Gemini] Success! Response: {}...", ai_text.chars().take(100).collect::<String>());
+    
+    Some(parse_ai_response(ai_text, project_name))
+}
+
+async fn handle_weave(
+    State(vault): State<Arc<AetherVault>>,
+    Json(payload): Json<WeaveRequest>,
+) -> Json<serde_json::Value> {
+    let manifest_path = format!("../../products/{}/manifest.yaml", payload.project);
+    
+    // Read current manifest
+    let manifest_content = match fs::read_to_string(&manifest_path) {
+        Ok(content) => content,
+        Err(e) => return Json(serde_json::json!({
+            "success": false,
+            "error": format!("Failed to read manifest: {}", e)
+        }))
+    };
+    
+    // Parse manifest
+    let mut manifest: serde_yaml::Value = match serde_yaml::from_str(&manifest_content) {
+        Ok(m) => m,
+        Err(e) => return Json(serde_json::json!({
+            "success": false,
+            "error": format!("Failed to parse manifest: {}", e)
+        }))
+    };
+    
+    // Get nodes array
+    let nodes = match manifest.get_mut("nodes").and_then(|n| n.as_sequence_mut()) {
+        Some(n) => n,
+        None => return Json(serde_json::json!({
+            "success": false,
+            "error": "Manifest has no nodes section"
+        }))
+    };
+    
+    let mut changes = Vec::new();
+    
+    // Remove nodes
+    if let Some(remove_list) = &payload.patch.remove_nodes {
+        for name in remove_list {
+            nodes.retain(|n| n.get("name").and_then(|v| v.as_str()) != Some(name.as_str()));
+            changes.push(format!("Removed: {}", name));
+        }
+    }
+    
+    // Modify nodes
+    if let Some(modify_list) = &payload.patch.modify_nodes {
+        for patch in modify_list {
+            for node in nodes.iter_mut() {
+                if node.get("name").and_then(|v| v.as_str()) == Some(&patch.name) {
+                    node["intent"] = serde_yaml::Value::String(patch.intent.clone());
+                    let deps: Vec<serde_yaml::Value> = patch.dependencies.iter()
+                        .map(|d| serde_yaml::Value::String(d.clone())).collect();
+                    node["dependencies"] = serde_yaml::Value::Sequence(deps);
+                    changes.push(format!("Modified: {}", patch.name));
+                }
+            }
+        }
+    }
+    
+    // Add nodes
+    if let Some(add_list) = &payload.patch.add_nodes {
+        for patch in add_list {
+            let mut new_node = serde_yaml::Mapping::new();
+            new_node.insert(serde_yaml::Value::String("name".into()), serde_yaml::Value::String(patch.name.clone()));
+            new_node.insert(serde_yaml::Value::String("intent".into()), serde_yaml::Value::String(patch.intent.clone()));
+            let deps: Vec<serde_yaml::Value> = patch.dependencies.iter()
+                .map(|d| serde_yaml::Value::String(d.clone())).collect();
+            new_node.insert(serde_yaml::Value::String("dependencies".into()), serde_yaml::Value::Sequence(deps));
+            nodes.push(serde_yaml::Value::Mapping(new_node));
+            changes.push(format!("Added: {}", patch.name));
+        }
+    }
+    
+    // Write manifest
+    let new_yaml = match serde_yaml::to_string(&manifest) {
+        Ok(s) => s,
+        Err(e) => return Json(serde_json::json!({"success": false, "error": format!("Serialize error: {}", e)}))
+    };
+    
+    if let Err(e) = fs::write(&manifest_path, &new_yaml) {
+        return Json(serde_json::json!({"success": false, "error": format!("Write error: {}", e)}));
+    }
+    
+    // Build new hash using orchestrator
+    let orchestrator = match aether_store::AetherOrchestrator::new((*vault).clone()) {
+        Ok(o) => o,
+        Err(e) => return Json(serde_json::json!({"success": false, "error": format!("Orchestrator error: {}", e)}))
+    };
+    let new_hash = match orchestrator.build_app(&new_yaml) {
+        Ok((h, _)) => h,
+        Err(e) => return Json(serde_json::json!({"success": false, "error": format!("Build error: {}", e)}))
+    };
+    
+    println!("[Weave] '{}' updated -> {}", payload.project, new_hash);
+    
+    Json(serde_json::json!({
+        "success": true,
+        "new_hash": new_hash,
+        "changes": changes,
+        "project": payload.project
+    }))
 }
 

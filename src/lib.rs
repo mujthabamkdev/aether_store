@@ -34,6 +34,22 @@ pub struct IdentityAtom {
     pub access_nodes: Vec<String>, // List of PermissionNode Hashes (Op:10)
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum ProjectStatus {
+    Building, // Manifest uploaded, not validated
+    Active,   // Validated and Live
+    Archived,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ProjectAtom {
+    pub name: String,
+    pub root_hash: String,
+    pub org_hash: String,
+    pub status: ProjectStatus,
+    pub created_at: u64,
+}
+
 #[derive(Error, Debug)]
 pub enum VaultError {
     #[error("Storage failure: {0}")]
@@ -189,6 +205,41 @@ impl AetherVault {
         match self.db.get(format!("ID:{}", hash).as_bytes())? {
             Some(data) => Ok(serde_json::from_slice(&data).unwrap()),
             None => Err(VaultError::IdentityNotFound),
+        }
+    }
+    
+    // --- Project Persistence (Sled) ---
+    pub fn persist_project(&self, project: &ProjectAtom) -> Result<String, VaultError> {
+        let serialized = serde_json::to_vec(project).unwrap();
+        // Key: "PROJ:{name}" (Unique Name per Instance, or add OrgHash if needed)
+        let key = format!("PROJ:{}", project.name);
+        self.db.insert(key.as_bytes(), serialized)?;
+        Ok(project.name.clone())
+    }
+
+    pub fn list_projects(&self) -> Result<Vec<ProjectAtom>, VaultError> {
+        let mut projects = Vec::new();
+        let prefix = "PROJ:";
+        for item in self.db.scan_prefix(prefix) {
+            if let Ok((_, value)) = item {
+                if let Ok(proj) = serde_json::from_slice::<ProjectAtom>(&value) {
+                    projects.push(proj);
+                }
+            }
+        }
+        Ok(projects)
+    }
+    
+    pub fn update_project_status(&self, name: &str, status: ProjectStatus) -> Result<(), VaultError> {
+        let key = format!("PROJ:{}", name);
+        if let Some(data) = self.db.get(key.as_bytes())? {
+             let mut proj: ProjectAtom = serde_json::from_slice(&data).unwrap();
+             proj.status = status;
+             let serialized = serde_json::to_vec(&proj).unwrap();
+             self.db.insert(key.as_bytes(), serialized)?;
+             Ok(())
+        } else {
+             Err(VaultError::NotFound)
         }
     }
 
