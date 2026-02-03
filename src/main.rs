@@ -51,11 +51,22 @@ struct LogicNodePatch {
     dependencies: Vec<String>,
 }
 
+#[derive(Deserialize, Serialize, Clone)]
+struct InputPatch {
+    name: String,
+    label: String,
+    input_type: String, // text, select, number
+    options: Option<Vec<String>>,
+}
+
 #[derive(Deserialize)]
 struct ManifestPatch {
     add_nodes: Option<Vec<LogicNodePatch>>,
     modify_nodes: Option<Vec<LogicNodePatch>>,
     remove_nodes: Option<Vec<String>>,
+    add_inputs: Option<Vec<InputPatch>>,
+    modify_inputs: Option<Vec<InputPatch>>,
+    remove_inputs: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -374,6 +385,8 @@ nodes:
         .route("/api/projects", get(handle_list_projects))
         .route("/api/chat", post(handle_chat))
         .route("/api/project/weave", post(handle_weave))
+        .route("/api/warehouse/inventory", get(handle_warehouse_inventory))
+        .route("/api/warehouse/inject", post(handle_warehouse_inject))
         .with_state(Arc::clone(&vault))
         .layer(cors)
         .fallback_service(ServeDir::new("../universal_shell"));
@@ -602,7 +615,16 @@ IMPORTANT:
 - For data scraping requests, add a node with intent describing the scraping task
 - For optimization, modify existing nodes or add caching nodes
 - For new features, add appropriate nodes with clear intents
-- Always include at least one dependency (use "root" or "fetch_data" if unsure)
+- REWIRING IS CRITICAL: If you add a node X that should be part of a flow A->B, you MUST:
+   1. Add X with dependency [A]
+   2. MODIFY B to change its dependency from [A] to [X]
+- Failure to rewire means the new node will be ignored.
+- INPUT SCHEMA: If your new logic requires user input (e.g., sort order, price limit), you MUST add it to `add_inputs`:
+    {{ "name": "var_name", "label": "User Label", "input_type": "select|text|number", "options": ["opt1", "opt2"] }}
+    Then use `{{var_name}}` in your node intent.
+- SYNC INPUTS: If you add support for a new value (e.g. "KTM" station) in logic, you MUST also add it to the `modify_inputs` options list if an input exists.
+- MODIFYING INPUTS: Use `modify_inputs` to update options or labels.
+- REMOVING INPUTS: Use `remove_inputs`: ["var_name"]
 - Keep node names lowercase with underscores
 - Be concise but helpful in your response"#, payload.project, manifest_info.chars().take(2000).collect::<String>());
 
@@ -627,13 +649,42 @@ IMPORTANT:
         }
     }
     
-    // All APIs failed
-    println!("[AI Error] All API keys exhausted or failed");
     Json(serde_json::json!({
         "mode": "CHAT",
         "response": "⚠️ All AI APIs are unavailable. Please check your API keys or try again later.",
         "project": project_name
     }))
+}
+
+async fn handle_warehouse_inventory(
+    State(vault): State<Arc<AetherVault>>,
+) -> Json<Vec<serde_json::Value>> {
+    let inventory = vault.inventory();
+    Json(inventory)
+}
+
+#[derive(Deserialize)]
+struct InjectRequest {
+    spec: serde_json::Value, // The logic atom spec
+}
+
+async fn handle_warehouse_inject(
+    State(vault): State<Arc<AetherVault>>,
+    Json(payload): Json<InjectRequest>,
+) -> Json<serde_json::Value> {
+    // 1. Hash the spec (Deterministic ID)
+    let spec_bytes = serde_json::to_vec(&payload.spec).unwrap();
+    let hash = blake3::hash(&spec_bytes).to_hex().to_string();
+    
+    // 2. Persist to Sled (Simulated logic atom wrapper)
+    if let Ok(atom) = serde_json::from_value::<aether_store::LogicAtom>(payload.spec.clone()) {
+        match vault.inject_atom(&atom) {
+            Ok(hash) => Json(serde_json::json!({"hash": hash, "status": "Injected"})),
+            Err(e) => Json(serde_json::json!({"error": e.to_string()}))
+        }
+    } else {
+        Json(serde_json::json!({"error": "Invalid Atom Spec"}))
+    }
 }
 
 async fn try_openrouter(
@@ -832,6 +883,44 @@ async fn handle_weave(
             changes.push(format!("Added: {}", patch.name));
         }
     }
+
+    // --- Input Patching ---
+    // Ensure inputs section exists
+    if manifest.get("inputs").is_none() {
+        if let Some(map) = manifest.as_mapping_mut() {
+            map.insert(serde_yaml::Value::String("inputs".into()), serde_yaml::Value::Sequence(Vec::new()));
+        }
+    }
+
+    let inputs = match manifest.get_mut("inputs").and_then(|n| n.as_sequence_mut()) {
+        Some(n) => n,
+        None => return Json(serde_json::json!({
+            "success": false,
+            "error": "Manifest inputs section missing or invalid"
+        }))
+    };
+
+    if let Some(add_inputs) = &payload.patch.add_inputs {
+        for patch in add_inputs {
+            let mut new_input = serde_yaml::Mapping::new();
+            new_input.insert(serde_yaml::Value::String("name".into()), serde_yaml::Value::String(patch.name.clone()));
+            new_input.insert(serde_yaml::Value::String("label".into()), serde_yaml::Value::String(patch.label.clone()));
+            new_input.insert(serde_yaml::Value::String("input_type".into()), serde_yaml::Value::String(patch.input_type.clone()));
+            if let Some(opts) = &patch.options {
+                 let opt_vec: Vec<serde_yaml::Value> = opts.iter().map(|o| serde_yaml::Value::String(o.clone())).collect();
+                 new_input.insert(serde_yaml::Value::String("options".into()), serde_yaml::Value::Sequence(opt_vec));
+            }
+            inputs.push(serde_yaml::Value::Mapping(new_input));
+            changes.push(format!("Added Input: {}", patch.name));
+        }
+    }
+
+    if let Some(remove_inputs) = &payload.patch.remove_inputs {
+        for name in remove_inputs {
+            inputs.retain(|n| n.get("name").and_then(|v| v.as_str()) != Some(name.as_str()));
+            changes.push(format!("Removed Input: {}", name));
+        }
+    }
     
     // Write manifest
     let new_yaml = match serde_yaml::to_string(&manifest) {
@@ -855,6 +944,12 @@ async fn handle_weave(
     
     println!("[Weave] '{}' updated -> {}", payload.project, new_hash);
     
+    // CRITICAL FIX: Persist the new hash to the Vault so the UI sees it!
+    if let Err(e) = vault.update_project_hash(&payload.project, &new_hash) {
+         println!("[Weave Error] Failed to update project hash: {}", e);
+         // Don't fail the request, but warn.
+    }
+
     Json(serde_json::json!({
         "success": true,
         "new_hash": new_hash,

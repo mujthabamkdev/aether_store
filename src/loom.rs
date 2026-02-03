@@ -98,6 +98,7 @@ impl AetherLoom {
              });
         }
         
+
         // 4. Output/Identity
         if parts[0] == "Output" {
             let ref_uri = write_blob(&[])?;
@@ -107,6 +108,56 @@ impl AetherLoom {
                 storage_ref: ref_uri,
                 context_id: context.to_string(),
             });
+        }
+
+        // 5. Merge/Union: "Merge <...>"
+        if parts[0] == "Merge" {
+             let ref_uri = write_blob(&[])?;
+             return Ok(LogicAtom {
+                 op_code: 3, // MERGE
+                 inputs: vec![],
+                 storage_ref: ref_uri,
+                 context_id: context.to_string(),
+             });
+        }
+
+        // 6. Web Scrape (Alias for Fetch)
+        if parts[0] == "Web" && parts.contains(&"scrape") {
+             // Hardcode the mock scraper URL for this demo intent
+             let url = "http://127.0.0.1:8080/kl/properties";
+             let contract = crate::IOContract {
+                 endpoint: url.to_string(),
+                 schema: serde_json::json!({"type": "array"}),
+                 sensitivity: 2,
+             };
+             
+             let blob = serde_json::to_vec(&contract)?;
+             let ref_uri = write_blob(&blob)?;
+             
+             return Ok(LogicAtom {
+                 op_code: 500,
+                 inputs: vec![],
+                 storage_ref: ref_uri,
+                 context_id: context.to_string(),
+             });
+        }
+
+        // 7. Trigger/Event: "Trigger data refresh when <event>"
+        // Example: "Trigger data refresh when the dropdown value changes"
+        if parts[0] == "Trigger" {
+             // We can parse the event details here or just store the raw intent for the UI to interpret
+             // For now, let's treat it as a Reactive Binding (OpCode 50)
+             let blob = serde_json::to_vec(&serde_json::json!({
+                 "event": intent
+             }))?;
+             let ref_uri = write_blob(&blob)?;
+             
+             return Ok(LogicAtom {
+                 op_code: 50, // REACTIVE_TRIGGER
+                 inputs: vec![],
+                 storage_ref: ref_uri,
+                 context_id: context.to_string(),
+             });
         }
 
 
@@ -125,6 +176,20 @@ impl AetherLoom {
              });
         }
 
-        Err(anyhow::anyhow!("Loom could not generic intent: '{}'", intent))
+        // --- PHASE II: SOVEREIGN SYNTHESIS PROTOCOL ---
+        // Fallback: Instead of crashing, return a "Synthesis Request" (OpCode 600)
+        // This tells the UI/Orchestrator: "I don't know this, but I am ready to learn."
+        // The original intent is preserved in the blob for the factory to analyze.
+        let blob = intent.as_bytes().to_vec();
+        let ref_uri = write_blob(&blob)?;
+        
+        println!("[Loom] Intent '{}' unknown -> Triggering Synthesis (OpCode 600)", intent);
+        
+        Ok(LogicAtom {
+            op_code: 600, // SYNTHESIS_REQUIRED
+            inputs: vec![],
+            storage_ref: ref_uri,
+            context_id: context.to_string(),
+        })
     }
 }

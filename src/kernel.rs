@@ -102,6 +102,23 @@ impl AetherKernel {
                 }
                 Ok(serde_json::json!([]))
             },
+            3 => { // MERGE / UNION
+                let mut merged = Vec::new();
+                for res in input_results {
+                     if let Some(arr) = res.as_array() {
+                         merged.extend(arr.clone());
+                     }
+                }
+                Ok(serde_json::Value::Array(merged))
+            },
+            50 => { // REACTIVE_TRIGGER
+                 // This is a UI-Hint OpCode. In the backend, it acts as a pass-through or configuration echo.
+                 // The "root" deployment will include this in the graph, so the UI knows to bind an event.
+                 let data = self.resolve_data(&atom)?;
+                 let config: serde_json::Value = serde_json::from_slice(&data)
+                     .map_err(|e| KernelError::Runtime(e.to_string()))?;
+                 Ok(config)
+            },
             100 => { // FINANCIAL / AUDIT (Identity)
                 if let Some(res) = input_results.get(0) {
                     Ok(res.clone())
@@ -125,6 +142,19 @@ impl AetherKernel {
                 } else {
                      Ok(serde_json::json!({"error": "Gateway has no input resonance"}))
                 }
+            },
+            600 => { // SYNTHESIS_REQUIRED
+                 let data = self.resolve_data(&atom)?;
+                 let intent = String::from_utf8_lossy(&data).to_string();
+                 
+                 // Signal to UI: "I need to learn this."
+                 // The UI (Architect Mode) should pick this up and trigger the generation flow.
+                 Ok(serde_json::json!({
+                     "status": "SYNTHESIS_PENDING",
+                     "intent": intent,
+                     "hash": hash,
+                     "type": "Logic Gap"
+                 }))
             },
             _ => Ok(serde_json::json!(null))
         }

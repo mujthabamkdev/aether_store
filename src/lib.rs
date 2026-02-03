@@ -230,17 +230,28 @@ impl AetherVault {
         Ok(projects)
     }
     
-    pub fn update_project_status(&self, name: &str, status: ProjectStatus) -> Result<(), VaultError> {
+    pub fn get_project(&self, name: &str) -> Result<ProjectAtom, VaultError> {
         let key = format!("PROJ:{}", name);
         if let Some(data) = self.db.get(key.as_bytes())? {
-             let mut proj: ProjectAtom = serde_json::from_slice(&data).unwrap();
-             proj.status = status;
-             let serialized = serde_json::to_vec(&proj).unwrap();
-             self.db.insert(key.as_bytes(), serialized)?;
-             Ok(())
+            let proj: ProjectAtom = serde_json::from_slice(&data).unwrap();
+            Ok(proj)
         } else {
-             Err(VaultError::NotFound)
+            Err(VaultError::NotFound)
         }
+    }
+
+    pub fn update_project_status(&self, name: &str, status: ProjectStatus) -> Result<(), VaultError> {
+        let mut proj = self.get_project(name)?;
+        proj.status = status;
+        self.persist_project(&proj)?;
+        Ok(())
+    }
+
+    pub fn update_project_hash(&self, name: &str, hash: &str) -> Result<(), VaultError> {
+        let mut proj = self.get_project(name)?;
+        proj.root_hash = hash.to_string();
+        self.persist_project(&proj)?;
+        Ok(())
     }
 
     /// Verifies if a User (via IdentityHash) has resonance (access) to a Project (via ProjectHash)
@@ -262,6 +273,33 @@ impl AetherVault {
             }
         }
         false
+    }
+
+    pub fn inventory(&self) -> Vec<serde_json::Value> {
+        let mut atoms = Vec::new();
+        for item in self.db.iter() {
+            if let Ok((key, value)) = item {
+                let key_str = String::from_utf8_lossy(&key).to_string();
+                if !key_str.starts_with("ID:") && !key_str.starts_with("PROJ:") {
+                    if let Ok(atom) = serde_json::from_slice::<LogicAtom>(&value) {
+                         atoms.push(serde_json::json!({
+                             "hash": key_str,
+                             "op_code": atom.op_code,
+                             "context_id": atom.context_id,
+                             // We could include more metadata like 'intent' if we stored it in the atom or blob
+                         }));
+                    }
+                }
+            }
+        }
+        atoms
+    }
+
+    pub fn inject_atom(&self, atom: &LogicAtom) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let blob = serde_json::to_vec(atom)?;
+        let hash = blake3::hash(&blob).to_hex().to_string();
+        self.db.insert(hash.as_bytes(), blob)?;
+        Ok(hash)
     }
 
     pub fn export_graph_json(&self) -> serde_json::Value {
