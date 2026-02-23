@@ -30,7 +30,7 @@ impl AetherGuard {
         Ok(())
     }
 
-    pub fn check(&self, atom: &crate::LogicAtom) -> Result<()> {
+    pub fn check(&self, _atom: &crate::LogicAtom) -> Result<()> {
         // Existing checks
         Ok(())
     }
@@ -57,5 +57,20 @@ impl AetherGuard {
             return endpoint.contains("localhost") || endpoint.contains("127.0.0.1") || endpoint.contains(".my");
         }
         true
+    }
+
+    /// Verifies if a resource usage is within sustainable limits (Demo for Z3 inequality solving)
+    pub fn verify_sustainability(&self, usage_metric: i32, limit: i32) -> bool {
+        let solver = Solver::new();
+        let usage = z3::ast::Int::from_i64(usage_metric as i64);
+        let max_limit = z3::ast::Int::from_i64(limit as i64);
+        
+        // Law: usage < limit
+        solver.assert(&usage.lt(&max_limit));
+        
+        match solver.check() {
+            SatResult::Sat => true,
+            _ => false,
+        }
     }
 }

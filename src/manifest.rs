@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -25,4 +26,6 @@ pub struct AetherManifest {
     #[serde(default)]
     pub imports: Vec<ManifestImport>,
     pub nodes: Vec<ManifestNode>,
+    #[serde(default)]
+    pub styles: Option<serde_yaml::Value>, // CSS Variables and custom CSS blocks
 }

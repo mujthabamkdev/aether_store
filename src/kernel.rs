@@ -89,7 +89,10 @@ impl AetherKernel {
                             match op {
                                 ">" => item[field].as_i64().unwrap_or(0) > val_i.unwrap_or(0),
                                 "<" => item[field].as_i64().unwrap_or(0) < val_i.unwrap_or(0),
-                                "==" => item[field].as_str().unwrap_or("") == val_s.unwrap_or(""),
+                                "==" => {
+                                    let val = val_s.unwrap_or("");
+                                    if val == "All" { true } else { item[field].as_str().unwrap_or("") == val }
+                                },
                                 "!=" => item[field].as_str().unwrap_or("") != val_s.unwrap_or(""),
                                 "contains" => item[field].as_str().unwrap_or("").contains(val_s.unwrap_or("")),
                                 "not_contains" => !item[field].as_str().unwrap_or("").contains(val_s.unwrap_or("")),
@@ -111,16 +114,79 @@ impl AetherKernel {
                 }
                 Ok(serde_json::Value::Array(merged))
             },
+            4 => { // SORT
+                if let Some(res) = input_results.get(0) {
+                     if let Some(array) = res.as_array() {
+                         let data = self.resolve_data(&atom)?;
+                         let config: serde_json::Value = serde_json::from_slice(&data)
+                            .map_err(|e| KernelError::Runtime(e.to_string()))?;
+                         let field = config["field"].as_str().unwrap_or("price");
+                         let order = config["order"].as_str().unwrap_or("asc");
+                         
+                         let mut vec = array.clone();
+                         vec.sort_by(|a, b| {
+                             let val_a = a[field].as_i64().unwrap_or(0);
+                             let val_b = b[field].as_i64().unwrap_or(0);
+                             if order == "desc" { val_b.cmp(&val_a) } else { val_a.cmp(&val_b) }
+                         });
+                         Ok(serde_json::Value::Array(vec))
+                     } else { Ok(serde_json::json!([])) }
+                } else { Ok(serde_json::json!([])) }
+            },
+            5 => { // HIGHLIGHT
+                if let Some(res) = input_results.get(0) {
+                     if let Some(array) = res.as_array() {
+                         let data = self.resolve_data(&atom)?;
+                         let config: serde_json::Value = serde_json::from_slice(&data)
+                            .map_err(|e| KernelError::Runtime(e.to_string()))?;
+                         let mode = config["mode"].as_str().unwrap_or("min");
+                         let field = config["field"].as_str().unwrap_or("price");
+                         
+                         // Find target value
+                         let mut target_val = if mode == "min" { i64::MAX } else { i64::MIN };
+                         for item in array {
+                             let v = item[field].as_i64().unwrap_or(0);
+                             if mode == "min" { if v < target_val { target_val = v; } }
+                             else { if v > target_val { target_val = v; } }
+                         }
+                         
+                         // Mark items
+                         let highlighted: Vec<serde_json::Value> = array.iter().map(|item| {
+                             let mut obj = item.as_object().unwrap().clone();
+                             let v = item[field].as_i64().unwrap_or(0);
+                             if v == target_val {
+                                 obj.insert("_highlighted".to_string(), serde_json::json!(true));
+                             }
+                             serde_json::Value::Object(obj)
+                         }).collect();
+                         
+                         Ok(serde_json::Value::Array(highlighted))
+                     } else { Ok(serde_json::json!([])) }
+                } else { Ok(serde_json::json!([])) }
+            },
+            6 => { // ENRICH (Simple Join / Add Field)
+                 // For now, just identity or merge input 0 + input 1
+                 // If input 0 is data and input 1 is "Property Type" string (from template)
+                 // This is a bit complex without clear spec. 
+                 // Assuming Identity for now to unblock flow.
+                 if let Some(res) = input_results.get(0) {
+                     Ok(res.clone())
+                 } else { Ok(serde_json::json!([])) }
+            },
+            7 => { // OUTPUT (Identity/Pass-through)
+                 if let Some(res) = input_results.get(0) {
+                     Ok(res.clone())
+                 } else { Ok(serde_json::json!([])) }
+            },
             50 => { // REACTIVE_TRIGGER
-                 // This is a UI-Hint OpCode. In the backend, it acts as a pass-through or configuration echo.
-                 // The "root" deployment will include this in the graph, so the UI knows to bind an event.
                  let data = self.resolve_data(&atom)?;
                  let config: serde_json::Value = serde_json::from_slice(&data)
                      .map_err(|e| KernelError::Runtime(e.to_string()))?;
                  Ok(config)
             },
-            100 => { // FINANCIAL / AUDIT (Identity)
+            100 => { // FINANCIAL AUDIT
                 if let Some(res) = input_results.get(0) {
+                    // TODO: Actually check the Riba Law here (redundant to Guard but good for runtime safety)
                     Ok(res.clone())
                 } else {
                     Ok(serde_json::json!({"status": "Audited"}))

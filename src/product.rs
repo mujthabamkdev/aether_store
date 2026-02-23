@@ -6,6 +6,8 @@ pub struct InputSchema {
     pub label: String,      // Human readable label (e.g. "Station Type")
     pub input_type: String, // "text", "select", "number"
     pub options: Option<Vec<String>>, // For select
+    #[serde(flatten)]
+    pub constraints: std::collections::HashMap<String, serde_yaml::Value>, // Catches min/max/step etc
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

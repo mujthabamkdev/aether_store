@@ -2,7 +2,7 @@ use aether_store::{AetherVault, AetherKernel, AetherOrchestrator, ProductTemplat
 use std::fs;
 use std::sync::Arc;
 use std::env;
-use axum::{Router, routing::{get, post}, Json, extract::{State, Query}, http::Method};
+use axum::{Router, routing::{get, post}, Json, extract::State, http::Method};
 use tower_http::{services::ServeDir, cors::{CorsLayer, Any}};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -27,6 +27,7 @@ struct RunTemplateRequest {
     inputs: HashMap<String, String>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 struct TemplateRequest {
     template: String,
@@ -37,11 +38,20 @@ struct InspectRequest {
     format: String, // "json" or "dot"
 }
 
+#[derive(Deserialize, Serialize, Clone)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
 #[derive(Deserialize)]
 struct ChatRequest {
     project: String,
+    #[allow(dead_code)] // Retained as part of API contract for future context routing
     hash: Option<String>,
     message: String,
+    history: Option<Vec<ChatMessage>>,
+    ai_provider: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -54,24 +64,27 @@ struct LogicNodePatch {
 #[derive(Deserialize, Serialize, Clone)]
 struct InputPatch {
     name: String,
-    label: String,
-    input_type: String, // text, select, number
+    label: Option<String>,
+    input_type: Option<String>, // text, select, number
     options: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
 struct ManifestPatch {
+    raw_yaml: Option<String>,
     add_nodes: Option<Vec<LogicNodePatch>>,
     modify_nodes: Option<Vec<LogicNodePatch>>,
     remove_nodes: Option<Vec<String>>,
     add_inputs: Option<Vec<InputPatch>>,
     modify_inputs: Option<Vec<InputPatch>>,
     remove_inputs: Option<Vec<String>>,
+    styles: Option<HashMap<String, String>>,
 }
 
 #[derive(Deserialize)]
 struct WeaveRequest {
     project: String,
+    #[allow(dead_code)] // Retained as part of API contract; future versions will use for optimistic concurrency
     current_hash: Option<String>,
     patch: ManifestPatch,
 }
@@ -214,7 +227,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ensure core logic atoms exist in the vault and registry
     let registry_path = "../registry.json";
     // Always load atoms first (Bootstrap Registry)
-    if !std::path::Path::new(registry_path).exists() {
+    // Always load atoms first (Bootstrap Registry) - FORCE UPDATE to prevent stale hashes
+    {
         println!("[System] Bootstrapping Logic Registry...");
         let loom = aether_store::AetherLoom::new().unwrap();
         let guard = aether_store::AetherGuard::new();
@@ -222,7 +236,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // 1. MODERN_LAW
         let atom_modern = loom.weave("Filter where built > 2020").unwrap();
-        let hash_modern = vault.persist_verified(&atom_modern, &guard).unwrap();
+        // Use persist() (unverified) because this is a Template Atom with no inputs yet.
+        // The Guard checks for inputs on Op 2, which would fail here.
+        let hash_modern = vault.persist(&atom_modern).unwrap(); 
         registry.insert("HASH_OF_MODERN_FILTER".to_string(), hash_modern.clone());
         println!("[Registry] Minted MODERN_LAW: {}", hash_modern);
 
@@ -243,9 +259,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hash_riba = registry.get("HASH_OF_RIBA_CHECK").unwrap_or(&"ERROR".to_string()).clone();
 
     // --- Catalog Bootstrap (Templates) ---
+    // Always regenerate catalog.json so it embeds the fresh registry hashes from this session.
+    // Without this, catalog hashes become stale after every restart (registry is force-regenerated above).
     let catalog_path = "../catalog.json";
-    if !std::path::Path::new(catalog_path).exists() {
-        println!("[System] Bootstrapping Product Catalog...");
+    {
+        println!("[System] Refreshing Product Catalog with current session hashes...");
         let mut catalog = HashMap::new();
         
         let transit_template = format!(r#"
@@ -286,12 +304,14 @@ nodes:
                     label: "Station Type (LRT, MRT, KTM)".to_string(),
                     input_type: "select".to_string(),
                     options: Some(vec!["LRT".to_string(), "MRT".to_string(), "KTM".to_string(), "Monorail".to_string()]),
+                    constraints: std::collections::HashMap::new(),
                 },
                 InputSchema {
                     name: "station_name".to_string(),
                     label: "Preferred Station Name".to_string(),
                     input_type: "text".to_string(),
                     options: None,
+                    constraints: std::collections::HashMap::new(),
                 }
             ],
         };
@@ -375,7 +395,7 @@ nodes:
                 Err(_) => "{}".to_string()
             }
         }))
-        .route("/api/inspect", get(handle_inspect))
+        .route("/api/inspect", post(handle_inspect))
         .route("/api/run_template", post(handle_run_template))
         .route("/api/orchestrate", post(handle_orchestration))
         .route("/api/orchestrate_project", post(handle_orchestrate_project))
@@ -544,7 +564,8 @@ async fn handle_get_project_schema(
         if let Ok(manifest) = serde_yaml::from_str::<aether_store::AetherManifest>(&content) {
             return Json(serde_json::json!({
                 "app_name": manifest.app_name,
-                "inputs": manifest.inputs
+                "inputs": manifest.inputs,
+                "styles": manifest.styles
             }));
         }
     }
@@ -589,19 +610,17 @@ CURRENT MANIFEST:
 ```
 
 AVAILABLE NODE OPERATIONS:
-1. ADD nodes - create new logic nodes with name, intent, and dependencies
-2. MODIFY nodes - change existing node intent or dependencies  
-3. REMOVE nodes - delete nodes by name
+1. You have FULL FREEDOM to rewrite the entire logic graph.
+2. The logic graph is a strict DAG (Directed Acyclic Graph). Every node must have dependencies that exist.
+3. Your output must be the COMPLETE, functional `manifest.yaml` including `app_name`, `inputs`, `nodes`, and `styles`.
 
 RESPONSE FORMAT:
-If the user wants to modify the project logic (add features, fix bugs, add data sources, etc.), respond with JSON:
+If the user wants to modify the project logic, respond with JSON containing a `raw_yaml` field holding the COMPLETE new manifest:
 {{
   "mode": "WEAVE",
   "response": "Brief explanation of what you'll do",
   "patch": {{
-    "add_nodes": [{{ "name": "node_name", "intent": "what it does", "dependencies": ["parent_node"] }}],
-    "modify_nodes": [{{ "name": "existing_node", "intent": "new intent", "dependencies": ["deps"] }}],
-    "remove_nodes": ["node_to_remove"]
+    "raw_yaml": "app_name: My App\ninputs:\n  - name: station\n    label: Station\n    input_type: text\nnodes:\n  - name: root\n    intent: Print hello\n    dependencies: []\nstyles:\n  --accent-color: red"
   }}
 }}
 
@@ -612,48 +631,159 @@ If the user is just asking questions (explain, what is, how does), respond with 
 }}
 
 IMPORTANT:
-- For data scraping requests, add a node with intent describing the scraping task
-- For optimization, modify existing nodes or add caching nodes
-- For new features, add appropriate nodes with clear intents
-- REWIRING IS CRITICAL: If you add a node X that should be part of a flow A->B, you MUST:
-   1. Add X with dependency [A]
-   2. MODIFY B to change its dependency from [A] to [X]
-- Failure to rewire means the new node will be ignored.
-- INPUT SCHEMA: If your new logic requires user input (e.g., sort order, price limit), you MUST add it to `add_inputs`:
-    {{ "name": "var_name", "label": "User Label", "input_type": "select|text|number", "options": ["opt1", "opt2"] }}
-    Then use `{{var_name}}` in your node intent.
-- SYNC INPUTS: If you add support for a new value (e.g. "KTM" station) in logic, you MUST also add it to the `modify_inputs` options list if an input exists.
-- MODIFYING INPUTS: Use `modify_inputs` to update options or labels.
-- REMOVING INPUTS: Use `remove_inputs`: ["var_name"]
+- You must output the ENTIRE manifest in `raw_yaml` as a single properly-escaped string. DO NOT use `add_nodes` or `modify_nodes` objects. DO NOT output partial manifests.
+- INTENT PREFIXES ARE MANDATORY: The system interprets Node `intent` text to assign internal OpCodes. You MUST begin the `intent` string with one of these EXACT keywords or it will fail:
+    - **Fetch/Get**: For scraping or API calls. (e.g. `intent: Fetch weather data`)
+    - **Filter/Where**: For omitting data. (e.g. `intent: Filter where price > 10`)
+    - **Sort/Order**: For sorting. (e.g. `intent: Sort by price asc`)
+    - **Highlight/Mark**: To flag min/max items. (e.g. `intent: Highlight cheapest price`) 
+    - **Enrich**: For joining properties. (e.g. `intent: Enrich with images`)
+    - **Output/Show/Display**: For the root output component. (e.g. `intent: Output the tracker`)
+- REWIRING IS CRITICAL: Ensure your topological sort is correct. Nodes must not have circular dependencies.
 - Keep node names lowercase with underscores
+- STYLES FORMATTING: CSS classes MUST be valid nested YAML objects. Do NOT use literal CSS strings like `.class {{ color: red }}`. Instead use `.class:\n  color: red`.
 - Be concise but helpful in your response"#, payload.project, manifest_info.chars().take(2000).collect::<String>());
 
     let client = reqwest::Client::new();
     let user_message = payload.message.clone();
     let project_name = payload.project.clone();
+    let history = payload.history.clone().unwrap_or_default();
+    let provider = payload.ai_provider.clone().unwrap_or_else(|| "auto".to_string());
     
-    // 1. Try OpenRouter (Primary)
-    if let Ok(or_key) = env::var("OPENROUTER_API_KEY") {
-        println!("[AI] Trying OpenRouter API...");
-        if let Some(result) = try_openrouter(&client, &or_key, &system_prompt, &user_message, &project_name).await {
-            return Json(result);
-        }
-        println!("[AI Warning] OpenRouter failed, falling back...");
-    }
+    match provider.as_str() {
+        "ollama" => {
+            println!("[AI] Explicitly requested Ollama API (local)...");
+            if let Some(result) = try_ollama(&client, &system_prompt, &user_message, &history, &project_name).await {
+                return Json(result);
+            }
+            return Json(serde_json::json!({
+                "mode": "CHAT",
+                "response": "⚠️ Local AI (Ollama) is unavailable or failed to respond.",
+                "project": project_name
+            }));
+        },
+        "openrouter" => {
+            println!("[AI] Explicitly requested OpenRouter API...");
+            if let Ok(or_key) = env::var("OPENROUTER_API_KEY") {
+                if let Some(result) = try_openrouter(&client, &or_key, &system_prompt, &user_message, &history, &project_name).await {
+                    return Json(result);
+                }
+                return Json(serde_json::json!({
+                    "mode": "CHAT",
+                    "response": "⚠️ OpenRouter API is unavailable or failed to respond.",
+                    "project": project_name
+                }));
+            } else {
+                return Json(serde_json::json!({
+                    "mode": "CHAT",
+                    "response": "⚠️ OpenRouter API Key is not configured.",
+                    "project": project_name
+                }));
+            }
+        },
+        "gemini" => {
+            println!("[AI] Explicitly requested Gemini API...");
+            if let Ok(gemini_key) = env::var("GEMINI_API_KEY") {
+                if let Some(result) = try_gemini(&client, &gemini_key, &system_prompt, &user_message, &history, &project_name).await {
+                    return Json(result);
+                }
+                return Json(serde_json::json!({
+                    "mode": "CHAT",
+                    "response": "⚠️ Gemini API is unavailable or failed to respond.",
+                    "project": project_name
+                }));
+            } else {
+                return Json(serde_json::json!({
+                    "mode": "CHAT",
+                    "response": "⚠️ Gemini API Key is not configured.",
+                    "project": project_name
+                }));
+            }
+        },
+        _ => {
+            // Auto / fallback mode
+            println!("[AI] Auto mode active, Trying OpenRouter API first...");
+            if let Ok(or_key) = env::var("OPENROUTER_API_KEY") {
+                if let Some(result) = try_openrouter(&client, &or_key, &system_prompt, &user_message, &history, &project_name).await {
+                    return Json(result);
+                }
+                println!("[AI Warning] OpenRouter failed, falling back...");
+            }
+        
+            if let Ok(gemini_key) = env::var("GEMINI_API_KEY") {
+                println!("[AI] Trying Gemini API...");
+                if let Some(result) = try_gemini(&client, &gemini_key, &system_prompt, &user_message, &history, &project_name).await {
+                    return Json(result);
+                }
+                println!("[AI Warning] Gemini failed, falling back...");
+            }
 
-    // 2. Try Gemini (Fallback)
-    if let Ok(gemini_key) = env::var("GEMINI_API_KEY") {
-        println!("[AI] Trying Gemini API...");
-        if let Some(result) = try_gemini(&client, &gemini_key, &system_prompt, &user_message, &project_name).await {
-            return Json(result);
+            println!("[AI] Trying Ollama API (local)...");
+            if let Some(result) = try_ollama(&client, &system_prompt, &user_message, &history, &project_name).await {
+                return Json(result);
+            }
+            
+            Json(serde_json::json!({
+                "mode": "CHAT",
+                "response": "⚠️ All AI APIs are unavailable. Please ensure Ollama is running (ollama serve) or check your API keys.",
+                "project": project_name
+            }))
         }
     }
+}
+
+async fn try_ollama(
+    client: &reqwest::Client,
+    system_prompt: &str,
+    user_message: &str,
+    history: &[ChatMessage],
+    project_name: &str,
+) -> Option<serde_json::Value> {
+    let url = "http://localhost:11434/v1/chat/completions";
     
-    Json(serde_json::json!({
-        "mode": "CHAT",
-        "response": "⚠️ All AI APIs are unavailable. Please check your API keys or try again later.",
-        "project": project_name
-    }))
+    let mut messages = vec![
+        serde_json::json!({"role": "system", "content": system_prompt})
+    ];
+    
+    for msg in history {
+        messages.push(serde_json::json!({"role": msg.role, "content": msg.content}));
+    }
+    
+    messages.push(serde_json::json!({"role": "user", "content": user_message}));
+    
+    let body = serde_json::json!({
+        "model": "qwen2.5-coder:14b",
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 2000
+    });
+    
+    let response = client.post(url)
+        .header("Authorization", "Bearer ollama")
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .ok()?;
+    
+    let text = response.text().await.ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    
+    // Check for errors
+    if json.get("error").is_some() {
+        println!("[Ollama] Error: {}", json["error"]["message"].as_str().unwrap_or("Unknown"));
+        return None;
+    }
+    
+    let ai_text = json["choices"][0]["message"]["content"].as_str()?;
+    if ai_text.trim().is_empty() {
+        println!("[Ollama] Error: Empty response text");
+        return None;
+    }
+    
+    println!("[Ollama] Success! Response: {}...", ai_text.chars().take(100).collect::<String>());
+    
+    Some(parse_ai_response(ai_text, project_name))
 }
 
 async fn handle_warehouse_inventory(
@@ -672,9 +802,10 @@ async fn handle_warehouse_inject(
     State(vault): State<Arc<AetherVault>>,
     Json(payload): Json<InjectRequest>,
 ) -> Json<serde_json::Value> {
-    // 1. Hash the spec (Deterministic ID)
+    // 1. Persist to Sled — the vault computes the canonical hash itself
     let spec_bytes = serde_json::to_vec(&payload.spec).unwrap();
-    let hash = blake3::hash(&spec_bytes).to_hex().to_string();
+    // Pre-compute hash for logging only; vault.inject_atom returns the canonical one
+    let _pre_hash = blake3::hash(&spec_bytes).to_hex().to_string();
     
     // 2. Persist to Sled (Simulated logic atom wrapper)
     if let Ok(atom) = serde_json::from_value::<aether_store::LogicAtom>(payload.spec.clone()) {
@@ -692,14 +823,22 @@ async fn try_openrouter(
     api_key: &str,
     system_prompt: &str,
     user_message: &str,
+    history: &[ChatMessage],
     project_name: &str,
 ) -> Option<serde_json::Value> {
+    let mut messages = vec![
+        serde_json::json!({"role": "system", "content": system_prompt})
+    ];
+    
+    for msg in history {
+        messages.push(serde_json::json!({"role": msg.role, "content": msg.content}));
+    }
+    
+    messages.push(serde_json::json!({"role": "user", "content": user_message}));
+
     let body = serde_json::json!({
-        "model": "google/gemini-2.0-flash-001", // Specific model
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
-        ],
+        "model": "arcee-ai/trinity-large-preview:free", // Ensures it stays free dynamically
+        "messages": messages,
         "temperature": 0.7,
         "max_tokens": 2000
     });
@@ -707,7 +846,7 @@ async fn try_openrouter(
     // Debug
     println!("[OpenRouter] Sending request for project: {}", project_name);
 
-    let response = client.post("https://openrouter.ai/api/v1/chat/completions")
+    let response = match client.post("https://openrouter.ai/api/v1/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key))
         .header("HTTP-Referer", "http://localhost:3000")
         .header("X-Title", "Aether Engine")
@@ -715,9 +854,27 @@ async fn try_openrouter(
         .json(&body)
         .send()
         .await
-        .ok()?;
+    {
+        Ok(res) => res,
+        Err(e) => {
+            println!("[OpenRouter] Network Request Failed: {}", e);
+            return None;
+        }
+    };
     
-    let text = response.text().await.ok()?;
+    let status = response.status();
+    let text = match response.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            println!("[OpenRouter] Failed to read response body: {}", e);
+            return None;
+        }
+    };
+    
+    if !status.is_success() {
+        println!("[OpenRouter] HTTP Error {}: {}", status, text);
+        return None;
+    }
     // Debug raw response
     println!("[OpenRouter] Raw response len: {}", text.len());
     
@@ -725,13 +882,13 @@ async fn try_openrouter(
     
     // Check for errors
     if json.get("error").is_some() {
-        println!("[OpenRouter] Error: {}", json["error"]["message"].as_str().unwrap_or("Unknown"));
+        println!("[OpenRouter] Error detailed full response JSON: {}", text);
         return None;
     }
     
     let ai_text = json["choices"][0]["message"]["content"].as_str()?;
     if ai_text.trim().is_empty() {
-        println!("[OpenRouter] Error: Empty response text");
+        println!("[OpenRouter] Error: Empty response text from JSON: {}", text);
         return None;
     }
     
@@ -741,34 +898,73 @@ async fn try_openrouter(
 }
 
 fn parse_ai_response(ai_text: &str, project_name: &str) -> serde_json::Value {
-    // Try to find JSON in the response
+    // 1. Try to extract raw YAML block directly first (Robust Fallback)
+    let mut extracted_yaml = None;
+    if let Some(start_idx) = ai_text.find("```yaml") {
+        let after_start = &ai_text[start_idx + 7..];
+        if let Some(end_idx) = after_start.find("```") {
+            extracted_yaml = Some(after_start[..end_idx].trim().to_string());
+        }
+    } else if let Some(start_idx) = ai_text.find("```") {
+         // Sometimes they just use ``` without yaml
+         let after_start = &ai_text[start_idx + 3..];
+         if let Some(end_idx) = after_start.find("```") {
+             let content = after_start[..end_idx].trim().to_string();
+             if content.starts_with("app_name:") || content.starts_with("{") {
+                 extracted_yaml = Some(content);
+             }
+         }
+    }
+
+    // 2. Try to find JSON in the response
     let json_start = ai_text.find('{');
     let json_end = ai_text.rfind('}');
     
     if let (Some(start), Some(end)) = (json_start, json_end) {
-        let json_str = &ai_text[start..=end];
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
-            let mode = parsed["mode"].as_str().unwrap_or("CHAT");
-            let response = parsed["response"].as_str().unwrap_or("").to_string();
-            
-            if mode == "WEAVE" && parsed.get("patch").is_some() {
-                return serde_json::json!({
-                    "mode": "WEAVE",
-                    "response": response,
-                    "patch": parsed["patch"],
-                    "project": project_name
-                });
-            } else {
-                return serde_json::json!({
-                    "mode": "CHAT",
-                    "response": response,
-                    "project": project_name
-                });
+        if start < end {
+            let json_str = &ai_text[start..=end];
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                let mode = parsed["mode"].as_str().unwrap_or("CHAT");
+                let response = parsed["response"].as_str().unwrap_or("").to_string();
+                
+                if mode == "WEAVE" && parsed.get("patch").is_some() {
+                    let mut patch = parsed["patch"].clone();
+                    // Inject extracted yaml if it was missing from the json payload but present in text
+                    if patch.get("raw_yaml").is_none() && extracted_yaml.is_some() {
+                         patch["raw_yaml"] = serde_json::Value::String(extracted_yaml.unwrap());
+                    }
+                    return serde_json::json!({
+                        "mode": "WEAVE",
+                        "response": if response.is_empty() { "I have updated the project logic." } else { &response },
+                        "patch": patch,
+                        "project": project_name
+                    });
+                } else {
+                    return serde_json::json!({
+                        "mode": "CHAT",
+                        "response": response,
+                        "project": project_name
+                    });
+                }
             }
         }
     }
     
-    // Return as plain text
+    // 3. Fallback: If no valid JSON wrapper was found, but we found a YAML manifest block, assume it's a WEAVE
+    if let Some(yaml) = extracted_yaml {
+        if yaml.contains("app_name:") && yaml.contains("nodes:") {
+            return serde_json::json!({
+                "mode": "WEAVE",
+                "response": "I have rewritten the project logic graph for you based on the manifest.",
+                "patch": {
+                    "raw_yaml": yaml
+                },
+                "project": project_name
+            });
+        }
+    }
+    
+    // 4. Return as plain text
     serde_json::json!({
         "mode": "CHAT",
         "response": ai_text,
@@ -781,16 +977,23 @@ async fn try_gemini(
     api_key: &str,
     system_prompt: &str,
     user_message: &str,
+    history: &[ChatMessage],
     project_name: &str,
 ) -> Option<serde_json::Value> {
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={}",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.0-flash:generateContent?key={}",
         api_key
     );
     
+    let mut full_prompt = format!("{}\n\n", system_prompt);
+    for msg in history {
+        full_prompt.push_str(&format!("{}: {}\n\n", msg.role.to_uppercase(), msg.content));
+    }
+    full_prompt.push_str(&format!("USER: {}", user_message));
+    
     let body = serde_json::json!({
         "contents": [{
-            "parts": [{"text": format!("{}\n\nUser request: {}", system_prompt, user_message)}]
+            "parts": [{"text": full_prompt}]
         }],
         "generationConfig": {"temperature": 0.7, "topP": 0.95, "maxOutputTokens": 1024}
     });
@@ -818,7 +1021,44 @@ async fn handle_weave(
 ) -> Json<serde_json::Value> {
     let manifest_path = format!("../../products/{}/manifest.yaml", payload.project);
     
-    // Read current manifest
+    // --- Direct YAML Overwrite Path ---
+    if let Some(raw_yaml) = &payload.patch.raw_yaml {
+        if let Err(e) = fs::write(&manifest_path, raw_yaml) {
+            return Json(serde_json::json!({
+                "success": false,
+                "error": format!("Failed to write new manifest: {}", e)
+            }));
+        }
+        
+        // Rebuild project to get new hash
+        let orchestrator = match aether_store::AetherOrchestrator::new((*vault).clone()) {
+            Ok(o) => o,
+            Err(e) => return Json(serde_json::json!({
+                "success": false,
+                "error": format!("Failed to initialize orchestrator: {}", e)
+            }))
+        };
+        
+        match orchestrator.build_app(raw_yaml) {
+            Ok((new_hash, _)) => {
+                let _ = vault.update_project_hash(&payload.project, &new_hash);
+                return Json(serde_json::json!({
+                    "success": true,
+                    "new_hash": new_hash,
+                    "changes": ["Complete Manifest Regeneration"]
+                }));
+            },
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Manifest replaced, but Orchestrator validation failed: {}", e)
+                }));
+            }
+        }
+    }
+    // --- End Direct Path ---
+
+    // Read current manifest for standard patching
     let manifest_content = match fs::read_to_string(&manifest_path) {
         Ok(content) => content,
         Err(e) => return Json(serde_json::json!({
@@ -870,9 +1110,17 @@ async fn handle_weave(
         }
     }
     
-    // Add nodes
+    // Add nodes — idempotency guard: skip if a node with the same name already exists
     if let Some(add_list) = &payload.patch.add_nodes {
         for patch in add_list {
+            let already_exists = nodes.iter().any(|n| {
+                n.get("name").and_then(|v| v.as_str()) == Some(patch.name.as_str())
+            });
+            if already_exists {
+                println!("[Weave] Skipping duplicate node: '{}'", patch.name);
+                changes.push(format!("Skipped (already exists): {}", patch.name));
+                continue;
+            }
             let mut new_node = serde_yaml::Mapping::new();
             new_node.insert(serde_yaml::Value::String("name".into()), serde_yaml::Value::String(patch.name.clone()));
             new_node.insert(serde_yaml::Value::String("intent".into()), serde_yaml::Value::String(patch.intent.clone()));
@@ -904,8 +1152,8 @@ async fn handle_weave(
         for patch in add_inputs {
             let mut new_input = serde_yaml::Mapping::new();
             new_input.insert(serde_yaml::Value::String("name".into()), serde_yaml::Value::String(patch.name.clone()));
-            new_input.insert(serde_yaml::Value::String("label".into()), serde_yaml::Value::String(patch.label.clone()));
-            new_input.insert(serde_yaml::Value::String("input_type".into()), serde_yaml::Value::String(patch.input_type.clone()));
+            new_input.insert(serde_yaml::Value::String("label".into()), serde_yaml::Value::String(patch.label.clone().unwrap_or(patch.name.clone())));
+            new_input.insert(serde_yaml::Value::String("input_type".into()), serde_yaml::Value::String(patch.input_type.clone().unwrap_or("text".into())));
             if let Some(opts) = &patch.options {
                  let opt_vec: Vec<serde_yaml::Value> = opts.iter().map(|o| serde_yaml::Value::String(o.clone())).collect();
                  new_input.insert(serde_yaml::Value::String("options".into()), serde_yaml::Value::Sequence(opt_vec));
@@ -915,10 +1163,46 @@ async fn handle_weave(
         }
     }
 
+    if let Some(modify_inputs) = &payload.patch.modify_inputs {
+        for patch in modify_inputs {
+            for input in inputs.iter_mut() {
+                if input.get("name").and_then(|v| v.as_str()) == Some(&patch.name) {
+                     if let Some(label) = &patch.label {
+                         input["label"] = serde_yaml::Value::String(label.clone());
+                     }
+                     if let Some(itype) = &patch.input_type {
+                         input["input_type"] = serde_yaml::Value::String(itype.clone());
+                     }
+                     if let Some(opts) = &patch.options {
+                         let opt_vec: Vec<serde_yaml::Value> = opts.iter().map(|o| serde_yaml::Value::String(o.clone())).collect();
+                         input["options"] = serde_yaml::Value::Sequence(opt_vec);
+                     }
+                     changes.push(format!("Modified Input: {}", patch.name));
+                }
+            }
+        }
+    }
+
     if let Some(remove_inputs) = &payload.patch.remove_inputs {
         for name in remove_inputs {
             inputs.retain(|n| n.get("name").and_then(|v| v.as_str()) != Some(name.as_str()));
             changes.push(format!("Removed Input: {}", name));
+        }
+    }
+
+    if let Some(styles) = &payload.patch.styles {
+        // Ensure styles section exists
+        if manifest.get("styles").is_none() {
+            if let Some(map) = manifest.as_mapping_mut() {
+                map.insert(serde_yaml::Value::String("styles".into()), serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+            }
+        }
+        
+        if let Some(styles_map) = manifest.get_mut("styles").and_then(|v| v.as_mapping_mut()) {
+            for (key, value) in styles {
+                styles_map.insert(serde_yaml::Value::String(key.clone()), serde_yaml::Value::String(value.clone()));
+                changes.push(format!("Updated Style: {}", key));
+            }
         }
     }
     

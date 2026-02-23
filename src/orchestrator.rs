@@ -62,7 +62,45 @@ impl AetherOrchestrator {
         let mut node_map: HashMap<String, String> = HashMap::new();
         let mut root_hint: Option<String> = None;
 
-        for node in final_manifest.nodes {
+        // --- TOPOLOGICAL SORT START ---
+        // We must process dependencies before dependents.
+        // 1. Identify all available dependency sources (imports)
+        let mut available_deps: std::collections::HashSet<String> = import_map.keys().cloned().collect();
+        
+        // 2. Queue of nodes to process
+        let mut pending_nodes: std::collections::VecDeque<crate::manifest::ManifestNode> = final_manifest.nodes.into();
+        let mut sorted_nodes = Vec::new();
+        
+        let mut stuck_counter = 0;
+        
+        while let Some(node) = pending_nodes.pop_front() {
+            // Check if all dependencies are met
+            let all_met = node.dependencies.iter().all(|d| available_deps.contains(d));
+            
+            if all_met {
+                // Can process this node
+                available_deps.insert(node.name.clone());
+                sorted_nodes.push(node);
+                stuck_counter = 0; // Reset counter on progress
+            } else {
+                // Push back to end of queue
+                pending_nodes.push_back(node);
+                stuck_counter += 1;
+                
+                // Cycle Detection / stuck check
+                if stuck_counter > pending_nodes.len() {
+                    println!("[Orchestrator] Warning: Cyclic dependency or missing dependency detected. Aborting sort for remaining nodes.");
+                    // Dump the rest in whatever order
+                    while let Some(n) = pending_nodes.pop_front() {
+                        sorted_nodes.push(n);
+                    }
+                    break;
+                }
+            }
+        }
+        // --- TOPOLOGICAL SORT END ---
+
+        for node in sorted_nodes {
             println!("[Orchestrator] Processing Node: '{}'", node.name);
             if node.name == "root" {
                 root_hint = node.ui_hint.clone();

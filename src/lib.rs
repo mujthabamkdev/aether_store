@@ -373,3 +373,18 @@ fn extract_rate(data: &[u8]) -> i32 {
     arr.copy_from_slice(&data[0..4]);
     i32::from_le_bytes(arr)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_manifest_parse() {
+        let content = fs::read_to_string("../../products/transit-home/manifest.yaml").unwrap();
+        match serde_yaml::from_str::<AetherManifest>(&content) {
+            Ok(_) => println!("OK"),
+            Err(e) => panic!("FAIL: {}", e),
+        }
+    }
+}
