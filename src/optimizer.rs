@@ -12,8 +12,8 @@ impl AetherOptimizer {
     /// Checks if a hash is slow and requests an 'Optimized Weave' from the Loom
     pub fn optimize_if_needed(&self, hash: &str, duration: u128, loom: &AetherLoom) -> Option<LogicAtom> {
         if duration > self.threshold_ns {
-            println!("\n[Optimizer] PERFORMANCE WARNING: Hash {} is slow ({}ns). Threshold: {}ns.", hash, duration, self.threshold_ns);
-            println!("[Optimizer] Triggering autonomous evolution...");
+            tracing::warn!(hash = %hash, duration = %duration, threshold = %self.threshold_ns, "Optimizer performance warning: slow node");
+            tracing::info!("Optimizer triggering autonomous evolution...");
             
             // Task the Loom to generate a faster version.
             // In a real system, we would pass the original atom or its source intent.
@@ -22,7 +22,7 @@ impl AetherOptimizer {
             
             match loom.weave(&intent) {
                 Ok(atom) => return Some(atom),
-                Err(e) => println!("[Optimizer] Failed to evolve: {}", e),
+                Err(e) => tracing::warn!(error = %e, "Optimizer failed to evolve"),
             }
         }
         None

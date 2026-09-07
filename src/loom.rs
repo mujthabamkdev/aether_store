@@ -25,7 +25,7 @@ impl AetherLoom {
         let intent_lower = intent.to_lowercase();
         let parts: Vec<&str> = intent.split_whitespace().collect();
         
-        println!("[Loom] Processing Intent: '{}' (Context: '{}')", intent, context);
+        tracing::info!(intent = %intent, context = %context, "Loom processing intent");
 
         if parts.is_empty() {
              return Err(anyhow::anyhow!("Empty intent"));
@@ -222,7 +222,7 @@ impl AetherLoom {
         let blob = intent.as_bytes().to_vec();
         let ref_uri = write_blob(&blob)?;
         
-        println!("[Loom] Intent '{}' unknown -> Triggering Synthesis (OpCode 600)", intent);
+        tracing::info!(intent = %intent, "Loom synthesis fallback OpCode 600");
         
         Ok(LogicAtom {
             op_code: 600, // SYNTHESIS_REQUIRED

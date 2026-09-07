@@ -1,11 +1,12 @@
-use crate::{AetherLoom, AetherVault, AetherGuard, AetherManifest};
-use std::collections::HashMap;
+use crate::{AetherLoom, AetherVault, AetherGuard, AetherManifest, Limits};
+use std::collections::{HashMap, HashSet};
 use anyhow::{Result, Context};
 
 pub struct AetherOrchestrator {
     loom: AetherLoom,
     vault: AetherVault,
     guard: AetherGuard,
+    limits: Limits,
 }
 
 impl AetherOrchestrator {
@@ -14,46 +15,54 @@ impl AetherOrchestrator {
             loom: AetherLoom::new()?,
             vault,
             guard: AetherGuard::new(),
+            limits: Limits::default(),
+        })
+    }
+
+    pub fn with_limits(vault: AetherVault, limits: Limits) -> Result<Self> {
+        Ok(Self {
+            loom: AetherLoom::new()?,
+            vault,
+            guard: AetherGuard::new(),
+            limits,
         })
     }
 
     pub fn build_app(&self, manifest_raw: &str) -> Result<(String, Option<String>)> {
+        let raw_len = manifest_raw.len();
+        if raw_len > self.limits.manifest_max_bytes {
+            anyhow::bail!("manifest exceeds {} bytes (got {})", self.limits.manifest_max_bytes, raw_len);
+        }
+
         let manifest: AetherManifest = serde_yaml::from_str(manifest_raw)
             .context("Failed to parse manifest YAML")?;
-        
+
+        if manifest.nodes.len() > self.limits.manifest_max_nodes {
+            anyhow::bail!("manifest exceeds {} nodes (got {})", self.limits.manifest_max_nodes, manifest.nodes.len());
+        }
+
         let mut final_manifest = manifest;
-        
-        // RECURSION: If extends is set, load parent and merge
+
         if let Some(ref parent_name) = final_manifest.extends {
-            println!("[Orchestrator] Recursion: '{}' extends '{}'", final_manifest.app_name, parent_name);
-            let parent_path = format!("../../products/{}/manifest.yaml", parent_name);
+            tracing::info!(child = %final_manifest.app_name, parent = %parent_name, "extends");
+            let parent_path = crate::Paths::discover().manifest_for(parent_name)
+                .map_err(|e| anyhow::anyhow!("resolving parent manifest path: {}", e))?;
             let parent_raw = std::fs::read_to_string(&parent_path)
-                .context("Msg")?;
-            
+                .with_context(|| format!("reading parent {}", parent_path.display()))?;
             let parent: AetherManifest = serde_yaml::from_str(&parent_raw)
-                .context("Msg")?;
-                
-            // Merge Strategies
-            // 1. Imports: Child overrides Parent (if duplicates, though vec doesn't map, so we append unique?)
-            //    Actually, simple append. If name collision, Child's usage will pick one (last one? first one? map insert logic)
-            //    We convert to map below, so last one wins. We want Child to win. 
-            //    So append Child imports AFTER Parent imports.
+                .context("parsing parent manifest")?;
+
             let mut merged_imports = parent.imports;
             merged_imports.extend(final_manifest.imports);
             final_manifest.imports = merged_imports;
-            
-            // 2. Nodes: Parent Nodes come FIRST (Global Laws), then Child Nodes.
-            //    Logic graph executes by dependency. If Child depends on Parent, Parent must exist in map.
-            //    So we process Parent Nodes first.
+
             let mut merged_nodes = parent.nodes;
             merged_nodes.extend(final_manifest.nodes);
             final_manifest.nodes = merged_nodes;
         }
 
-        println!("[Orchestrator] Building App: {}", final_manifest.app_name);
-        // Laws are applied via Registry imports now
+        tracing::info!(app = %final_manifest.app_name, "Building App");
 
-        // 0. Resolve Imports
         let mut import_map: HashMap<String, String> = HashMap::new();
         for import_item in final_manifest.imports {
             import_map.insert(import_item.name, import_item.hash);
@@ -62,111 +71,96 @@ impl AetherOrchestrator {
         let mut node_map: HashMap<String, String> = HashMap::new();
         let mut root_hint: Option<String> = None;
 
-        // --- TOPOLOGICAL SORT START ---
-        // We must process dependencies before dependents.
-        // 1. Identify all available dependency sources (imports)
-        let mut available_deps: std::collections::HashSet<String> = import_map.keys().cloned().collect();
-        
-        // 2. Queue of nodes to process
+        let mut available_deps: HashSet<String> = import_map.keys().cloned().collect();
         let mut pending_nodes: std::collections::VecDeque<crate::manifest::ManifestNode> = final_manifest.nodes.into();
         let mut sorted_nodes = Vec::new();
-        
         let mut stuck_counter = 0;
-        
+
         while let Some(node) = pending_nodes.pop_front() {
-            // Check if all dependencies are met
             let all_met = node.dependencies.iter().all(|d| available_deps.contains(d));
-            
             if all_met {
-                // Can process this node
                 available_deps.insert(node.name.clone());
                 sorted_nodes.push(node);
-                stuck_counter = 0; // Reset counter on progress
+                stuck_counter = 0;
             } else {
-                // Push back to end of queue
                 pending_nodes.push_back(node);
                 stuck_counter += 1;
-                
-                // Cycle Detection / stuck check
-                if stuck_counter > pending_nodes.len() {
-                    println!("[Orchestrator] Warning: Cyclic dependency or missing dependency detected. Aborting sort for remaining nodes.");
-                    // Dump the rest in whatever order
-                    while let Some(n) = pending_nodes.pop_front() {
-                        sorted_nodes.push(n);
-                    }
-                    break;
+                if stuck_counter > pending_nodes.len() && !pending_nodes.is_empty() {
+                    anyhow::bail!(
+                        "topological sort failed: cyclic or missing dependency detected after {} nodes",
+                        sorted_nodes.len()
+                    );
                 }
             }
         }
-        // --- TOPOLOGICAL SORT END ---
 
         for node in sorted_nodes {
-            println!("[Orchestrator] Processing Node: '{}'", node.name);
+            tracing::info!(node = %node.name, "processing");
             if node.name == "root" {
                 root_hint = node.ui_hint.clone();
             }
-            
-            // 1. Resolve Logic: Intent (New) vs use_ref (Linked)
+
             let mut atom = if let Some(ref intent) = node.intent {
-                // Generative Mode: Ask Loom (Use Manifest App Name as Context)
-                 self.loom.weave_with_context(intent, &final_manifest.app_name)?
+                self.loom.weave_with_context(intent, &final_manifest.app_name)?
             } else if let Some(ref ref_name) = node.use_ref {
-                // Linker Mode: Fetch from Registry/Vault
-                if let Some(hash) = import_map.get(ref_name) {
-                    println!("[Orchestrator] Linking to Master Atom: {} -> {}", ref_name, hash);
-                    // Fetch the master atom to use as a template
-                    // We need to clone it because we will modify its inputs (dependencies)
-                    let master_atom = self.vault.fetch(hash)?;
-                    
-                    // Create a new instance (same logic/data, new inputs)
-                    // Context ID: Keep the Master's Context (e.g., "global") or override?
-                    // Inheritance Principle: If I use "Global Riba Law", I am creating a "Project X Riba Check" node?
-                    // No, the node *is* the application of the law.
-                    // If the node is "My Law Check", it belongs to "Project X".
-                    // But the logic comes from "Global".
-                    // Let's set the context of this specific *instance* (node in the graph) to Project X.
-                    // This allows "Project X" to execute it.
-                    // If we kept "global", then "Project X" executing "global" atom is fine IF Guard allows Global.
-                    // BUT, if we set it to Project X, we are "contextualizing" the instance.
-                    // Let's set it to Project X (Manifest App Name).
-                    crate::LogicAtom {
-                        op_code: master_atom.op_code,
-                        inputs: vec![], // Will be filled below
-                        storage_ref: master_atom.storage_ref.clone(),
-                        context_id: final_manifest.app_name.clone(),
+                let mut hash = import_map.get(ref_name).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("import not found: {}", ref_name))?;
+                if let Ok(reg_str) = std::fs::read_to_string(
+                    crate::Paths::discover().registry_path
+                ) {
+                    if let Ok(reg) = serde_json::from_str::<HashMap<String, String>>(&reg_str) {
+                        if let Some(true_hash) = reg.get(&hash) {
+                            hash = true_hash.clone();
+                        }
                     }
-                } else {
-                    return Err(anyhow::anyhow!("Import not found"));
+                }
+                tracing::info!(ref_name = %ref_name, hash = %hash, "linking master atom");
+                let master_atom = self.vault.fetch(&hash)
+                    .with_context(|| format!("master atom {} not found", hash))?;
+                crate::LogicAtom {
+                    op_code: master_atom.op_code,
+                    inputs: vec![],
+                    storage_ref: master_atom.storage_ref.clone(),
+                    context_id: final_manifest.app_name.clone(),
                 }
             } else {
-                return Err(anyhow::anyhow!("Node '{}' must have either 'intent' or 'use_ref'", node.name));
+                anyhow::bail!("node '{}' must have either 'intent' or 'use_ref'", node.name);
             };
 
-            // 1.5 Link Dependencies
             for dep_name in &node.dependencies {
                 if let Some(dep_hash) = node_map.get(dep_name) {
                     atom.inputs.push(dep_hash.clone());
                 } else {
-                    println!("[Orchestrator] Warning: Dependency '{}' not found for node '{}'", dep_name, node.name);
+                    tracing::warn!(dep = %dep_name, node = %node.name, "dependency not found, dropping");
                 }
             }
 
-            // 2. Guard: Verify
+            // Depth check: input chain length.
+            let mut depth = 0usize;
+            let mut frontier: Vec<String> = atom.inputs.clone();
+            let mut visited: HashSet<String> = HashSet::new();
+            while let Some(h) = frontier.pop() {
+                if !visited.insert(h.clone()) { continue; }
+                depth += 1;
+                if depth > self.limits.manifest_max_depth * 8 {
+                    anyhow::bail!("node '{}' input chain too deep", node.name);
+                }
+                if let Ok(parent) = self.vault.fetch(&h) {
+                    frontier.extend(parent.inputs);
+                }
+            }
+
             let hash = self.vault.persist_verified(&atom, &self.guard)
                 .with_context(|| format!("Guard rejected node '{}'", node.name))?;
-            
-            println!("[Orchestrator] Node '{}' Persisted. Hash: {}", node.name, hash);
+            tracing::info!(node = %node.name, hash = %hash, "persisted");
             node_map.insert(node.name.clone(), hash.clone());
         }
 
-        // Return the Root Hash of the Application
         match node_map.get("root") {
             Some(h) => Ok((h.clone(), root_hint)),
             None => {
-                // Return the last one if 'root' is not defined, explicitly for demo purposes
-                // or just an empty string if nothing processed.
-                 let last = node_map.values().last().cloned().unwrap_or_default();
-                 Ok((last, root_hint))
+                let last = node_map.values().last().cloned().unwrap_or_default();
+                Ok((last, root_hint))
             }
         }
     }

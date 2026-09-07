@@ -1,6 +1,9 @@
-use crate::{AetherVault, VaultError, LogicAtom};
+use crate::{AetherVault, VaultError, LogicAtom, SsrfVerdict, check_endpoint};
 use std::convert::TryInto;
 use thiserror::Error;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 #[derive(Error, Debug)]
 pub enum KernelError {
@@ -22,24 +25,20 @@ impl AetherKernel {
     }
 
     fn resolve_data(&self, atom: &LogicAtom) -> Result<Vec<u8>, KernelError> {
-        // Lazy Load from Storage
         crate::read_blob(&atom.storage_ref)
             .map_err(|e| KernelError::Runtime(format!("Blob Fetch Error: {}", e)))
     }
 
-    /// Fetches a node by hash and executed its logic (Legacy Sync)
     pub fn execute(&self, hash: &str) -> Result<i32, KernelError> {
         let atom = self.vault.fetch(hash).map_err(KernelError::Vault)?;
         let data = self.resolve_data(&atom)?;
-        
         match atom.op_code {
             1 => {
-                // ADD
                 if data.len() < 8 { return Err(KernelError::Runtime("Invalid data length for ADD".into())); }
                 let a = i32::from_le_bytes(data[0..4].try_into().unwrap());
                 let b = i32::from_le_bytes(data[4..8].try_into().unwrap());
                 Ok(a + b)
-            },
+            }
             100 => Ok(0),
             _ => Err(KernelError::InvalidOpCode(atom.op_code)),
         }
@@ -51,197 +50,172 @@ impl AetherKernel {
         let duration = start.elapsed().as_nanos();
         Ok((result, duration))
     }
-    
-    /// Smart Execution: recursive pipeline that returns JSON (Async)
+
     pub async fn execute_smart(&self, hash: &str) -> Result<serde_json::Value, KernelError> {
-        let atom = self.vault.fetch(hash).map_err(KernelError::Vault)?;
+        // Arc-clone the vault to break the &self lifetime so we can Box::pin
+        // recursively without lifetime gymnastics.
+        let kernel = Arc::new(AetherKernel::new(self.vault.clone()));
+        execute_recursive(kernel, hash.to_string(), 0, 32).await
+    }
+}
 
-        // Recursive: Execute dependencies in parallel (Async Resonance)
-        let futures = atom.inputs.iter().map(|h| Box::pin(self.execute_smart(h)));
-        let results = futures::future::join_all(futures).await;
-
-        let mut input_results = Vec::new();
-        for res in results {
-            input_results.push(res?);
+fn execute_recursive(
+    kernel: Arc<AetherKernel>,
+    hash: String,
+    depth: usize,
+    max_depth: usize,
+) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, KernelError>> + Send>> {
+    Box::pin(async move {
+        if depth > max_depth {
+            return Err(KernelError::Runtime(format!("execution depth {} exceeded cap {}", depth, max_depth)));
         }
+        let atom = kernel.vault.fetch(&hash).map_err(KernelError::Vault)?;
+
+        let mut futs = Vec::with_capacity(atom.inputs.len());
+        for h in atom.inputs.clone() {
+            let k = kernel.clone();
+            futs.push(execute_recursive(k, h, depth + 1, max_depth));
+        }
+        let results = futures::future::join_all(futs).await;
+        let mut input_results = Vec::with_capacity(results.len());
+        for res in results { input_results.push(res?); }
 
         match atom.op_code {
-            1 => { // ADD (Legacy wrapper)
-                 Ok(serde_json::json!(0)) 
-            },
-            2 => { // FILTER
-                // Input 0: The List
-                // Data: The Filter Logic JSON
+            1 => Ok(serde_json::json!(0)),
+            2 => {
                 if let Some(list) = input_results.get(0) {
                     if let Some(array) = list.as_array() {
-                        let data = self.resolve_data(&atom)?;
-                        let filter_config: serde_json::Value = serde_json::from_slice(&data)
-                            .map_err(|e| KernelError::Runtime(e.to_string()))?;
-                        let field = filter_config["field"].as_str().unwrap_or("");
-                        let op = filter_config["op"].as_str().unwrap_or("");
-                        let val_i = filter_config["val"].as_i64();
-                        let val_s = filter_config["val"].as_str();
-
-                        // Debug print
-                        println!("[Kernel] Filtering {} items with {} {} {}", array.len(), field, op, val_s.unwrap_or("NUM"));
-
-                        let filtered: Vec<_> = array.iter().filter(|item| {
-                            match op {
-                                ">" => item[field].as_i64().unwrap_or(0) > val_i.unwrap_or(0),
-                                "<" => item[field].as_i64().unwrap_or(0) < val_i.unwrap_or(0),
-                                "==" => {
-                                    let val = val_s.unwrap_or("");
-                                    if val == "All" { true } else { item[field].as_str().unwrap_or("") == val }
-                                },
-                                "!=" => item[field].as_str().unwrap_or("") != val_s.unwrap_or(""),
-                                "contains" => item[field].as_str().unwrap_or("").contains(val_s.unwrap_or("")),
-                                "not_contains" => !item[field].as_str().unwrap_or("").contains(val_s.unwrap_or("")),
-                                _ => true
+                        let data = kernel.resolve_data(&atom)?;
+                        let cfg: serde_json::Value = serde_json::from_slice(&data).map_err(|e| KernelError::Runtime(e.to_string()))?;
+                        let field = cfg["field"].as_str().unwrap_or("");
+                        let op = cfg["op"].as_str().unwrap_or("");
+                        let val_i = cfg["val"].as_i64();
+                        let val_s = cfg["val"].as_str();
+                        let filtered: Vec<_> = array.iter().filter(|item| match op {
+                            ">" => item[field].as_i64().unwrap_or(0) > val_i.unwrap_or(0),
+                            "<" => item[field].as_i64().unwrap_or(0) < val_i.unwrap_or(0),
+                            "==" => {
+                                let val = val_s.unwrap_or("");
+                                if val == "All" { true } else { item[field].as_str().unwrap_or("") == val }
                             }
+                            "!=" => item[field].as_str().unwrap_or("") != val_s.unwrap_or(""),
+                            "contains" => item[field].as_str().unwrap_or("").contains(val_s.unwrap_or("")),
+                            "not_contains" => !item[field].as_str().unwrap_or("").contains(val_s.unwrap_or("")),
+                            _ => true,
                         }).cloned().collect();
-                        
                         return Ok(serde_json::Value::Array(filtered));
                     }
                 }
                 Ok(serde_json::json!([]))
-            },
-            3 => { // MERGE / UNION
+            }
+            3 => {
                 let mut merged = Vec::new();
-                for res in input_results {
-                     if let Some(arr) = res.as_array() {
-                         merged.extend(arr.clone());
-                     }
-                }
+                for r in input_results { if let Some(a) = r.as_array() { merged.extend(a.clone()); } }
                 Ok(serde_json::Value::Array(merged))
-            },
-            4 => { // SORT
-                if let Some(res) = input_results.get(0) {
-                     if let Some(array) = res.as_array() {
-                         let data = self.resolve_data(&atom)?;
-                         let config: serde_json::Value = serde_json::from_slice(&data)
-                            .map_err(|e| KernelError::Runtime(e.to_string()))?;
-                         let field = config["field"].as_str().unwrap_or("price");
-                         let order = config["order"].as_str().unwrap_or("asc");
-                         
-                         let mut vec = array.clone();
-                         vec.sort_by(|a, b| {
-                             let val_a = a[field].as_i64().unwrap_or(0);
-                             let val_b = b[field].as_i64().unwrap_or(0);
-                             if order == "desc" { val_b.cmp(&val_a) } else { val_a.cmp(&val_b) }
-                         });
-                         Ok(serde_json::Value::Array(vec))
-                     } else { Ok(serde_json::json!([])) }
+            }
+            4 => {
+                if let Some(r) = input_results.get(0) {
+                    if let Some(arr) = r.as_array() {
+                        let data = kernel.resolve_data(&atom)?;
+                        let cfg: serde_json::Value = serde_json::from_slice(&data).map_err(|e| KernelError::Runtime(e.to_string()))?;
+                        let field = cfg["field"].as_str().unwrap_or("price");
+                        let order = cfg["order"].as_str().unwrap_or("asc");
+                        let mut v = arr.clone();
+                        v.sort_by(|a, b| {
+                            let va = a[field].as_i64().unwrap_or(0);
+                            let vb = b[field].as_i64().unwrap_or(0);
+                            if order == "desc" { vb.cmp(&va) } else { va.cmp(&vb) }
+                        });
+                        Ok(serde_json::Value::Array(v))
+                    } else { Ok(serde_json::json!([])) }
                 } else { Ok(serde_json::json!([])) }
-            },
-            5 => { // HIGHLIGHT
-                if let Some(res) = input_results.get(0) {
-                     if let Some(array) = res.as_array() {
-                         let data = self.resolve_data(&atom)?;
-                         let config: serde_json::Value = serde_json::from_slice(&data)
-                            .map_err(|e| KernelError::Runtime(e.to_string()))?;
-                         let mode = config["mode"].as_str().unwrap_or("min");
-                         let field = config["field"].as_str().unwrap_or("price");
-                         
-                         // Find target value
-                         let mut target_val = if mode == "min" { i64::MAX } else { i64::MIN };
-                         for item in array {
-                             let v = item[field].as_i64().unwrap_or(0);
-                             if mode == "min" { if v < target_val { target_val = v; } }
-                             else { if v > target_val { target_val = v; } }
-                         }
-                         
-                         // Mark items
-                         let highlighted: Vec<serde_json::Value> = array.iter().map(|item| {
-                             let mut obj = item.as_object().unwrap().clone();
-                             let v = item[field].as_i64().unwrap_or(0);
-                             if v == target_val {
-                                 obj.insert("_highlighted".to_string(), serde_json::json!(true));
-                             }
-                             serde_json::Value::Object(obj)
-                         }).collect();
-                         
-                         Ok(serde_json::Value::Array(highlighted))
-                     } else { Ok(serde_json::json!([])) }
+            }
+            5 => {
+                if let Some(r) = input_results.get(0) {
+                    if let Some(arr) = r.as_array() {
+                        let data = kernel.resolve_data(&atom)?;
+                        let cfg: serde_json::Value = serde_json::from_slice(&data).map_err(|e| KernelError::Runtime(e.to_string()))?;
+                        let mode = cfg["mode"].as_str().unwrap_or("min");
+                        let field = cfg["field"].as_str().unwrap_or("price");
+                        let mut tv = if mode == "min" { i64::MAX } else { i64::MIN };
+                        for item in arr {
+                            let v = item[field].as_i64().unwrap_or(0);
+                            if mode == "min" { if v < tv { tv = v; } } else { if v > tv { tv = v; } }
+                        }
+                        let hl: Vec<serde_json::Value> = arr.iter().map(|item| {
+                            let mut obj = item.as_object().unwrap().clone();
+                            let v = item[field].as_i64().unwrap_or(0);
+                            if v == tv { obj.insert("_highlighted".to_string(), serde_json::json!(true)); }
+                            serde_json::Value::Object(obj)
+                        }).collect();
+                        Ok(serde_json::Value::Array(hl))
+                    } else { Ok(serde_json::json!([])) }
                 } else { Ok(serde_json::json!([])) }
-            },
-            6 => { // ENRICH (Simple Join / Add Field)
-                 // For now, just identity or merge input 0 + input 1
-                 // If input 0 is data and input 1 is "Property Type" string (from template)
-                 // This is a bit complex without clear spec. 
-                 // Assuming Identity for now to unblock flow.
-                 if let Some(res) = input_results.get(0) {
-                     Ok(res.clone())
-                 } else { Ok(serde_json::json!([])) }
-            },
-            7 => { // OUTPUT (Identity/Pass-through)
-                 if let Some(res) = input_results.get(0) {
-                     Ok(res.clone())
-                 } else { Ok(serde_json::json!([])) }
-            },
-            50 => { // REACTIVE_TRIGGER
-                 let data = self.resolve_data(&atom)?;
-                 let config: serde_json::Value = serde_json::from_slice(&data)
-                     .map_err(|e| KernelError::Runtime(e.to_string()))?;
-                 Ok(config)
-            },
-            100 => { // FINANCIAL AUDIT
-                if let Some(res) = input_results.get(0) {
-                    // TODO: Actually check the Riba Law here (redundant to Guard but good for runtime safety)
-                    Ok(res.clone())
-                } else {
-                    Ok(serde_json::json!({"status": "Audited"}))
-                }
-            },
-            500 => { // IO
-                self.execute_io(hash).await
-            },
-            800 => { // GATEWAY / MASKING
-                // Input 0: The Internal Logic Result to be Masked
-                if let Some(internal_result) = input_results.get(0) {
-                     // In a real scenario, this might encrypt fields or filter sensitive keys
-                     // For now, we wrap it in a "Sovereign Envelope"
-                     Ok(serde_json::json!({
-                         "origin": "0xSOVEREIGN_ROOT", 
-                         "payload": internal_result,
-                         "masked_fields": ["private_logic_trace"]
-                     }))
-                } else {
-                     Ok(serde_json::json!({"error": "Gateway has no input resonance"}))
-                }
-            },
-            600 => { // SYNTHESIS_REQUIRED
-                 let data = self.resolve_data(&atom)?;
-                 let intent = String::from_utf8_lossy(&data).to_string();
-                 
-                 // Signal to UI: "I need to learn this."
-                 // The UI (Architect Mode) should pick this up and trigger the generation flow.
-                 Ok(serde_json::json!({
-                     "status": "SYNTHESIS_PENDING",
-                     "intent": intent,
-                     "hash": hash,
-                     "type": "Logic Gap"
-                 }))
-            },
-            _ => Ok(serde_json::json!(null))
+            }
+            6 => {
+                if let Some(base) = input_results.get(0) {
+                    if let Some(arr) = base.as_array() {
+                        let mut enriched = arr.clone();
+                        if let Some(extra) = input_results.get(1) {
+                            if let Some(obj) = extra.as_object() {
+                                for item in enriched.iter_mut() {
+                                    if let Some(o) = item.as_object_mut() {
+                                        for (k, v) in obj { o.insert(k.clone(), v.clone()); }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(serde_json::Value::Array(enriched))
+                    } else { Ok(base.clone()) }
+                } else { Ok(serde_json::json!([])) }
+            }
+            7 => Ok(input_results.get(0).cloned().unwrap_or_else(|| serde_json::json!([]))),
+            50 => {
+                let data = kernel.resolve_data(&atom)?;
+                let cfg: serde_json::Value = serde_json::from_slice(&data).map_err(|e| KernelError::Runtime(e.to_string()))?;
+                Ok(cfg)
+            }
+            100 => Ok(input_results.get(0).cloned().unwrap_or_else(|| serde_json::json!({"status": "Audited"}))),
+            500 => execute_io(kernel, &hash).await,
+            800 => Ok(if let Some(r) = input_results.get(0) {
+                serde_json::json!({"origin": "0xSOVEREIGN_ROOT", "payload": r, "masked_fields": ["private_logic_trace"]})
+            } else {
+                serde_json::json!({"error": "Gateway has no input resonance"})
+            }),
+            600 => {
+                let data = kernel.resolve_data(&atom)?;
+                let intent = String::from_utf8_lossy(&data).to_string();
+                Ok(serde_json::json!({"status": "SYNTHESIS_PENDING", "intent": intent, "hash": hash, "type": "Logic Gap"}))
+            }
+            _ => Ok(serde_json::json!(null)),
         }
+    })
+}
+
+async fn execute_io(kernel: Arc<AetherKernel>, hash: &str) -> Result<serde_json::Value, KernelError> {
+    let atom = kernel.vault.fetch(hash).map_err(KernelError::Vault)?;
+    if atom.op_code != 500 { return Err(KernelError::InvalidOpCode(atom.op_code)); }
+    let data = kernel.resolve_data(&atom)?;
+    let contract: crate::IOContract = serde_json::from_slice(&data)
+        .map_err(|e| KernelError::Runtime(format!("IO Contract Parse Error: {}", e)))?;
+    tracing::info!(endpoint = %contract.endpoint, "IO fetch");
+
+    match check_endpoint(&contract.endpoint, contract.sensitivity) {
+        SsrfVerdict::Allow => {}
+        SsrfVerdict::Deny(why) => return Err(KernelError::Runtime(format!("endpoint blocked by SSRF guard: {}", why))),
     }
 
-    pub async fn execute_io(&self, hash: &str) -> Result<serde_json::Value, KernelError> {
-        let atom = self.vault.fetch(hash).map_err(KernelError::Vault)?;
-        
-        if atom.op_code == 500 {
-            let data = self.resolve_data(&atom)?;
-            let contract: crate::IOContract = serde_json::from_slice(&data)
-                .map_err(|e| KernelError::Runtime(format!("IO Contract Parse Error: {}", e)))?;
-            println!("[Kernel] Fetching IO: {}", contract.endpoint);
-            
-            let response = reqwest::get(&contract.endpoint).await
-                .map_err(|e| KernelError::Runtime(format!("Network Error: {}", e)))?
-                .json::<serde_json::Value>().await
-                .map_err(|e| KernelError::Runtime(format!("JSON Parse Error: {}", e)))?;
-                
-            return Ok(response);
-        }
-        Err(KernelError::InvalidOpCode(atom.op_code))
-    }
+    let cap = 8 * 1024 * 1024;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| KernelError::Runtime(format!("client build: {}", e)))?;
+    let response = client.get(&contract.endpoint).send().await
+        .map_err(|e| KernelError::Runtime(format!("Network Error: {}", e)))?;
+    let bytes = response.bytes().await
+        .map_err(|e| KernelError::Runtime(format!("read body: {}", e)))?;
+    if bytes.len() > cap { return Err(KernelError::Runtime(format!("response exceeds {} bytes", cap))); }
+    let json: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| KernelError::Runtime(format!("JSON Parse Error: {}", e)))?;
+    Ok(json)
 }
